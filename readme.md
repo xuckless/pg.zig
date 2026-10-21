@@ -1,5 +1,7 @@
 # Native PostgreSQL driver for Zig
 
+> **This is [xuckless/pg.zig](https://github.com/xuckless/pg.zig), branch `anole`**: a fork of [karlseguin/pg.zig](https://github.com/karlseguin/pg.zig) (`master` 4d63344) for [Anole](https://github.com/xuckless/anole). It adds a read timeout, `Conn.cancel()`, an automatic prepared statement cache and pool lifetimes (each also on its own branch based on upstream `master`: `upstream-read-timeout`, `upstream-cancel-request`, `upstream-statement-cache`, `upstream-pool-lifetimes`), and, for this fork only, replaces OpenSSL with a TLS module that goes through `std.Io` (see [TLS](#tls)) and makes metrics optional.
+
 A native PostgresSQL driver / client for Zig. Supports [LISTEN](#listen--notify).
 
 See or run [example/main.zig](https://github.com/karlseguin/pg.zig/blob/master/example/main.zig) for a number of examples.
