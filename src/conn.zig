@@ -310,6 +310,7 @@ pub const Conn = struct {
         // The server closes the connection once it has handled the request.
         // Waiting for that (as libpq does) means that a query sent after
         // cancel() returns can't be the one that gets canceled.
+        try stream.setReadTimeout(cancel_wait_ms);
         var discard: [16]u8 = undefined;
         while (true) {
             const n = stream.read(&discard) catch |err| switch (err) {
@@ -319,6 +320,10 @@ pub const Conn = struct {
             if (n == 0) return;
         }
     }
+
+    // How long cancel() waits for the server to confirm it handled the
+    // request, by closing the connection.
+    const cancel_wait_ms = 5_000;
 
     // The process ID of the server process handling this connection, from
     // the server's BackendKeyData. 0 before auth.
