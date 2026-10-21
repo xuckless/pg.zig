@@ -61,7 +61,8 @@ pub fn parse(data: []const u8) Error {
             'F' => err.file = value,
             'L' => err.line = value,
             'R' => err.routine = value,
-            else => unreachable,
+            // "Frontends should silently ignore fields of unrecognized type."
+            else => {},
         }
         pos = value_end + 1;
     }

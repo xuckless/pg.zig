@@ -45,6 +45,32 @@ pub const Pool = struct {
         idle_timeout: ?u32 = null,
     };
 
+    pub const AcquireOpts = struct {
+        // When the pool opens a connection for this call and the server
+        // refuses it (error.PG: a wrong password, a database that doesn't
+        // exist), the server's error is copied here.
+        connect_error: ?*ConnectError = null,
+    };
+
+    // The server's error from a failed connect, owned by `allocator`.
+    pub const ConnectError = struct {
+        allocator: Allocator,
+        err: ?lib.proto.Error = null,
+        _data: ?[]u8 = null,
+
+        pub fn deinit(self: *ConnectError) void {
+            if (self._data) |d| self.allocator.free(d);
+            self.* = .{ .allocator = self.allocator };
+        }
+
+        fn set(self: *ConnectError, data: []const u8) void {
+            const owned = self.allocator.dupe(u8, data) catch return;
+            self.deinit();
+            self._data = owned;
+            self.err = lib.proto.Error.parse(owned);
+        }
+    };
+
     pub const Stats = struct {
         size: usize,
         available: usize,
@@ -126,7 +152,7 @@ pub const Pool = struct {
         }
 
         for (0..connect_on_init_count) |i| {
-            conns[i] = try newConnection(pool, true);
+            conns[i] = try newConnection(pool, true, null);
             opened_connections += 1;
         }
 
@@ -143,6 +169,10 @@ pub const Pool = struct {
     }
 
     pub fn acquire(self: *Pool) !*Conn {
+        return self.acquireOpts(.{});
+    }
+
+    pub fn acquireOpts(self: *Pool, opts: AcquireOpts) !*Conn {
         const conns = self._conns;
         const io = self._io;
         const deadline: Io.Clock.Timestamp = .fromNow(io, .{
@@ -205,12 +235,12 @@ pub const Pool = struct {
         self.closeExpired(expired_buf[0..expired_count]);
         expired_count = 0;
 
-        return idle orelse self.openConnection();
+        return idle orelse self.openConnection(opts.connect_error);
     }
 
     // Opens a connection for a slot that acquire already reserved in _open.
-    fn openConnection(self: *Pool) !*Conn {
-        return newConnection(self, false) catch |err| {
+    fn openConnection(self: *Pool, connect_error: ?*ConnectError) !*Conn {
+        return newConnection(self, false, connect_error) catch |err| {
             self.dropSlot();
             return err;
         };
@@ -383,7 +413,7 @@ pub const Pool = struct {
     }
 };
 
-fn newConnection(pool: *Pool, log_failure: bool) !*Conn {
+fn newConnection(pool: *Pool, log_failure: bool, connect_error: ?*Pool.ConnectError) !*Conn {
     const opts = &pool._opts;
     const allocator = pool._allocator;
     const io = pool._io;
@@ -401,6 +431,9 @@ fn newConnection(pool: *Pool, log_failure: bool) !*Conn {
     errdefer conn.deinit();
 
     conn.auth(opts.auth) catch |err| {
+        if (connect_error) |ce| {
+            if (conn._err_data) |data| ce.set(data);
+        }
         if (log_failure) {
             if (conn.err) |pg_err| {
                 log.err("connect error: {s}", .{pg_err.message});
@@ -451,6 +484,25 @@ test "Pool" {
         const affected = try c1.exec("delete from pool_test", .{});
         try t.expectEqual(1500, affected.?);
     }
+}
+
+test "Pool: acquireOpts copies the server's error when a connect is refused" {
+    var pool = try Pool.init(t.io, t.allocator, .{
+        .size = 1,
+        .auth = .{ .username = "pgz_user_scram_sha256", .password = "wrong", .database = "postgres" },
+        .connect_on_init_count = 0,
+    });
+    defer pool.deinit();
+
+    var ce = Pool.ConnectError{ .allocator = t.allocator };
+    defer ce.deinit();
+    try t.expectError(error.PG, pool.acquireOpts(.{ .connect_error = &ce }));
+    try t.expectString("28P01", ce.err.?.code);
+    try t.expectString("password authentication failed for user \"pgz_user_scram_sha256\"", ce.err.?.message);
+
+    // the slot it reserved was given back
+    try t.expectEqual(0, pool.stats().in_use);
+    try t.expectError(error.PG, pool.acquire());
 }
 
 test "Pool: grows on demand" {
