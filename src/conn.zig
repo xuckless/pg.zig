@@ -779,6 +779,21 @@ test "Conn: auth cleartext password" {
     }
 }
 
+test "Conn: auth md5 password" {
+    {
+        var conn = try Conn.open(t.io, t.allocator, .{});
+        defer conn.deinit();
+        try t.expectError(error.PG, conn.auth(.{ .username = "pgz_user_md5", .password = "wrong" }));
+        try t.expectString("password authentication failed for user \"pgz_user_md5\"", conn.err.?.message);
+    }
+
+    {
+        var conn = try Conn.open(t.io, t.allocator, .{});
+        defer conn.deinit();
+        try conn.auth(.{ .username = "pgz_user_md5", .password = "pgz_user_md5_pw", .database = "postgres" });
+    }
+}
+
 test "Conn: auth scram-sha-256 password" {
     {
         var conn = try Conn.open(t.io, t.allocator, .{});
@@ -1901,6 +1916,11 @@ test "PG: binary wrapper" {
     var c = try t.connect(.{});
     defer c.deinit();
 
+    // needs PostGIS, which the plain postgres image doesn't have
+    if (t.scalar(&c, "select count(*)::int from pg_available_extensions where name = 'postgis'") == 0) {
+        return error.SkipZigTest;
+    }
+
     _ = try c.exec(
         \\ create extension if not exists postgis;
         \\ create table if not exists places (
@@ -2248,7 +2268,7 @@ test "PG: rollback during error" {
 }
 
 test "open URI" {
-    const uri = try std.Uri.parse("postgresql://postgres:postgres@127.0.0.1:5432/postgres?tcp_user_timeout=5000");
+    const uri = try std.Uri.parse("postgresql://postgres:postgres@127.0.0.1/postgres?tcp_user_timeout=5000");
     var conn = try Conn.openAndAuthUri(t.io, t.allocator, uri);
     conn.deinit();
 }

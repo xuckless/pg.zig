@@ -434,13 +434,15 @@ test "Pool" {
         , .{});
     }
 
-    const t1 = try std.Thread.spawn(.{}, testPool, .{pool});
-    const t2 = try std.Thread.spawn(.{}, testPool, .{pool});
-    const t3 = try std.Thread.spawn(.{}, testPool, .{pool});
+    // Concurrent tasks rather than threads, so that it works on any Io (on
+    // std's Threaded they're threads anyway).
+    var f1 = try t.io.concurrent(testPool, .{pool});
+    var f2 = try t.io.concurrent(testPool, .{pool});
+    var f3 = try t.io.concurrent(testPool, .{pool});
 
-    t1.join();
-    t2.join();
-    t3.join();
+    f1.await(t.io);
+    f2.await(t.io);
+    f3.await(t.io);
 
     {
         const c1 = try pool.acquire();
@@ -499,8 +501,15 @@ test "Pool: acquire returns the connect error and frees the slot" {
     // bound but never listening, so connects are refused. Holding it for the
     // duration of the test keeps anything else off the port.
     const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    const socket = try addr.bind(io, .{ .mode = .stream });
-    defer socket.close(io);
+    var socket = try addr.bind(io, .{ .mode = .stream });
+    var socket_open = true;
+    defer if (socket_open) socket.close(io);
+    if (comptime @import("builtin").os.tag.isDarwin()) {
+        // macOS doesn't refuse a connection to a bound socket that isn't
+        // listening, it lets it time out: give the port up instead.
+        socket.close(io);
+        socket_open = false;
+    }
 
     var pool = try Pool.init(io, t.allocator, .{
         .size = 1,
@@ -878,7 +887,7 @@ test "Pool: initUri owns its connection strings" {
     // Heap-allocate the URI string and free it right after init to prove the pool
     // doesn't retain pointers into it. %73 == 's': decodes to "postgres" while also
     // forcing Uri to allocate a decoded copy into the parse arena.
-    const uri_str = try t.allocator.dupe(u8, "postgresql://postgre%73:postgres@127.0.0.1:5432/postgres");
+    const uri_str = try t.allocator.dupe(u8, "postgresql://postgre%73:postgres@127.0.0.1/postgres");
     const uri = try std.Uri.parse(uri_str);
 
     var pool = try Pool.initUri(t.io, t.allocator, uri, .{ .size = 2 });

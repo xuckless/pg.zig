@@ -258,18 +258,19 @@ test "Listener: timeout" {
 fn testListener(l: *Listener) !void {
     const io = t.io;
     var reset: std.Io.Event = .unset;
-    var tt = try std.Thread.spawn(.{}, struct {
+    // Concurrent tasks rather than threads, so that it works on any Io.
+    var stopper = try io.concurrent(struct {
         fn shutdown(io_p: Io, ll: *Listener, r: *std.Io.Event) !void {
             try r.wait(io_p);
             try ll.stop();
         }
     }.shutdown, .{ io, l, &reset });
-    tt.detach();
+    defer stopper.cancel(io) catch {};
 
     try l.listen("chan-1", .{});
     try l.listen("chan_2", .{});
 
-    const thrd = try std.Thread.spawn(.{}, testNotifier, .{});
+    var notifier = try io.concurrent(testNotifier, .{});
     {
         const notification = l.next().?;
         try t.expectString("chan-1", notification.channel);
@@ -290,7 +291,7 @@ fn testListener(l: *Listener) !void {
 
     reset.set(io);
     try t.expectEqual(null, l.next());
-    thrd.join();
+    try notifier.await(io);
 }
 
 fn testNotifier() !void {

@@ -3,3 +3,9 @@ zig-out/
 tests/server.key
 tests/server.crt
 zig-pkg
+# made by tests/run.sh (or make ssl) for each run, never committed
+tests/root.crt
+tests/root.srl
+tests/other.crt
+tests/client.crt
+tests/client.key

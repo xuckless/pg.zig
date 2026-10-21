@@ -26,6 +26,9 @@ pub const sendTerminate = @import("stream.zig").sendTerminate;
 pub const metrics = @import("metrics.zig");
 pub const default_column_names = build_config.column_names;
 
+// The tests can run against a server on another port (-Dtest_port).
+pub const default_port: u16 = if (@hasDecl(build_config, "default_port")) build_config.default_port else 5432;
+
 const result = @import("result.zig");
 pub const Row = result.Row;
 pub const RowUnsafe = result.RowUnsafe;

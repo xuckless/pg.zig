@@ -1,10 +1,18 @@
 const std = @import("std");
+const build_config = @import("config");
 
 const Allocator = std.mem.Allocator;
 const Conn = @import("conn.zig").Conn;
 
 pub const allocator = std.testing.allocator;
-pub const io = std.testing.io;
+
+// The Io the tests run on: std's Threaded, or a zio runtime with pinned
+// executors when built with -Dzio=true. Set by setup().
+pub var io: std.Io = undefined;
+
+const test_zio = @hasDecl(build_config, "test_zio") and build_config.test_zio;
+const zio = if (test_zio) @import("zio") else struct {};
+var zio_runtime: if (test_zio) *zio.Runtime else void = undefined;
 
 pub var arena = std.heap.ArenaAllocator.init(allocator);
 
@@ -45,6 +53,14 @@ pub fn getRandom() std.Random.DefaultPrng {
 }
 
 pub fn setup() !void {
+    if (comptime test_zio) {
+        // not the testing allocator, which is checked for leaks after every test
+        zio_runtime = try zio.Runtime.init(std.heap.smp_allocator, .{ .executors = .exact(build_config.test_executors) });
+        io = zio_runtime.io();
+    } else {
+        io = std.testing.io;
+    }
+
     var c = try connect(.{});
     defer c.deinit();
     _ = c.exec(
@@ -52,10 +68,14 @@ pub fn setup() !void {
         \\ drop user if exists pgz_user_clear;
         \\ drop user if exists pgz_user_scram_sha256;
         \\ drop user if exists pgz_user_ssl;
+        \\ drop user if exists pgz_user_md5;
         \\ create user pgz_user_nopass;
         \\ create user pgz_user_clear with password 'pgz_user_clear_pw';
         \\ create user pgz_user_scram_sha256 with password 'pgz_user_scram_sha256_pw';
         \\ create user pgz_user_ssl with password 'pgz_user_ssl_pw';
+        \\ set password_encryption = 'md5';
+        \\ create user pgz_user_md5 with password 'pgz_user_md5_pw';
+        \\ reset password_encryption;
     , .{}) catch |err| try fail(c, err);
 
     _ = c.exec(
@@ -224,6 +244,12 @@ pub fn authOpts(opts: anytype) Conn.AuthOpts {
         .username = if (@hasField(T, "username")) opts.username else "postgres",
         .password = if (@hasField(T, "password")) opts.password else "postgres",
     };
+}
+
+pub fn teardown() void {
+    if (comptime test_zio) {
+        zio_runtime.deinit();
+    }
 }
 
 pub fn fail(c: Conn, err: anyerror) !void {

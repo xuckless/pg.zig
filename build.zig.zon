@@ -13,5 +13,12 @@
             .hash = "metrics-0.0.0-W7G4eGWhAQC-C6tpIW3uxJp-vl6rLyfJvoqJRLzF1SuS",
             .lazy = true,
         },
+        // Only for running the tests on zio (-Dzio=true): Anole's fork of
+        // lalinsky/zio, branch anole, as Anole pins it.
+        .zio = .{
+            .url = "git+https://github.com/xuckless/zio#ebb701426b4431a1e04ab1efb1d1cb43fc7f0c12",
+            .hash = "zio-0.19.0-xHbVVCwoLQDcc162sSq2-S-Qf_mklMYRj68z71pu6dAV",
+            .lazy = true,
+        },
     },
 }

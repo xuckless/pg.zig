@@ -736,15 +736,12 @@ const pg_module = b.dependency("pg", .{
 
 ## Tests
 
-Launch the Postgres database with the provided Docker Compose configuration:
+`tests/run.sh` starts a throwaway `postgres:17` in Docker (TLS on, with a CA and certificate made for the run; users for trust, cleartext, md5 and scram-sha-256 authentication) and runs the suite on std's Threaded Io and on a zio runtime with pinned executors, each with std's TLS and without TLS:
 
 ```console
-cd tests/
-docker compose up
+tests/run.sh                              # every configuration
+CONFIGS="threaded zio" tests/run.sh       # some of them
+PG_TEST_PORT=55432 TEST_FILTER=Pool tests/run.sh
 ```
 
-Run tests:
-
-```console
-zig build test
-```
+Against a server you started yourself: `zig build test -Dtest_port=5432 [-Dtls=std|none] [-Dzio=true]`. The server needs `tests/pg_hba.conf`, and TLS with a certificate signed by `tests/root.crt` (with `tests/other.crt` some other CA) for the TLS tests.

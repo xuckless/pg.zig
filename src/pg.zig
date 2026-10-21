@@ -35,6 +35,10 @@ test "tests:beforeAll" {
     std.testing.refAllDecls(@This());
 }
 
+test "tests:afterAll" {
+    t.teardown();
+}
+
 test "pg: uuidToHex" {
     try t.expectError(error.InvalidUUID, uuidToHex(&.{ 73, 190, 142, 9, 170, 250, 176, 16, 73, 21 }));
 

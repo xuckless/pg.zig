@@ -105,7 +105,7 @@ pub const Stream = struct {
                 const addr: Io.net.UnixAddress = try .init(host);
                 break :blk addr.connect(io);
             }
-            const port = opts.port orelse 5432;
+            const port = opts.port orelse lib.default_port;
             const hostname: Io.net.HostName = try .init(host);
             break :blk hostname.connect(io, port, .{ .mode = .stream });
         };
