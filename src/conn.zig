@@ -2322,6 +2322,35 @@ test "Conn: TLS verify-full" {
     }
 }
 
+test "Conn: TLS verify-ca" {
+    if (comptime lib.has_tls == false) return error.SkipZigTest;
+
+    var conn = t.connect(.{ .tls = Conn.Opts.TLS{ .verify_ca = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" }) catch |err| {
+        // std's TLS can't check a chain without checking the host name
+        if (err == error.TlsVerifyCaNotSupported) return error.SkipZigTest;
+        return err;
+    };
+    defer conn.deinit();
+    try t.expectEqual(true, try sslInUse(&conn));
+
+    try expectAnyError(Conn.open(t.io, t.allocator, .{ .tls = .{ .verify_ca = "tests/other.crt" } }));
+}
+
+test "Conn: TLS direct" {
+    if (comptime lib.has_tls == false) return error.SkipZigTest;
+
+    var conn = Conn.open(t.io, t.allocator, .{ .host = "127.0.0.1", .tls = .{ .verify_full = "tests/root.crt" }, .tls_direct = true }) catch |err| {
+        // std's TLS can't send ALPN, which direct TLS requires
+        if (err == error.TlsAlpnNotSupported) return error.SkipZigTest;
+        return err;
+    };
+    defer conn.deinit();
+    try t.expectEqual(true, conn._stream.isTls());
+    try conn.auth(.{ .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw", .database = "postgres" });
+    try t.expectEqual(true, try sslInUse(&conn));
+    try t.expectEqual(1, t.scalar(&conn, "select 1"));
+}
+
 test "Conn: TLS through the pool" {
     if (comptime lib.has_tls == false) return error.SkipZigTest;
 
