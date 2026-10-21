@@ -4,7 +4,6 @@ const lib = @import("lib.zig");
 const log = lib.log;
 const Conn = lib.Conn;
 const Result = lib.Result;
-const SSLCtx = lib.SSLCtx;
 const QueryRow = lib.QueryRow;
 const QueryRowUnsafe = lib.QueryRowUnsafe;
 const Listener = @import("listener.zig").Listener;
@@ -27,7 +26,6 @@ pub const Pool = struct {
     _allocator: Allocator,
     _mutex: Io.Mutex,
     _cond: Io.Condition,
-    _ssl_ctx: ?*lib.SSLCtx,
     // not to be used outside of init
     _arena: ArenaAllocator,
 
@@ -95,26 +93,16 @@ pub const Pool = struct {
             opts_copy.auth.startup_parameters = owned;
         }
 
-        var ssl_ctx: ?*SSLCtx = null;
-        if (comptime lib.has_openssl) {
-            switch (opts.connect.tls) {
-                .off => {},
-                else => |tls_config| {
-                    if (opts_copy.connect.host) |h| {
-                        opts_copy.connect._hostz = try aa.dupeSentinel(u8, h, 0);
-                    }
-                    // the cert path is re-read on every (re)connect, so own it too
-                    switch (tls_config) {
-                        .verify_full => |path| if (path) |p| {
-                            opts_copy.connect.tls = .{ .verify_full = try aa.dupe(u8, p) };
-                        },
-                        else => {},
-                    }
-                    ssl_ctx = try lib.initializeSSLContext(tls_config);
-                },
-            }
+        // the root certificate path is read on every (re)connect, so own it too
+        switch (opts.connect.tls) {
+            .verify_ca => |path| if (path) |p| {
+                opts_copy.connect.tls = .{ .verify_ca = try aa.dupe(u8, p) };
+            },
+            .verify_full => |path| if (path) |p| {
+                opts_copy.connect.tls = .{ .verify_full = try aa.dupe(u8, p) };
+            },
+            else => {},
         }
-        errdefer lib.freeSSLContext(ssl_ctx);
         const connect_on_init_count = opts.connect_on_init_count orelse size;
 
         pool.* = .{
@@ -124,7 +112,6 @@ pub const Pool = struct {
             ._conns = conns,
             ._arena = arena,
             ._opts = opts_copy,
-            ._ssl_ctx = ssl_ctx,
             ._open = connect_on_init_count,
             ._allocator = allocator,
             ._available = connect_on_init_count,
@@ -152,7 +139,6 @@ pub const Pool = struct {
             conn.deinit();
             allocator.destroy(conn);
         }
-        lib.freeSSLContext(self._ssl_ctx);
         self._arena.deinit();
     }
 

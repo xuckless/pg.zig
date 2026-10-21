@@ -682,36 +682,43 @@ The metrics are:
 * `pg_alloc_columns` - counts the number of columns states that were allocated. This indicates that your queries are returning more columns than `result_state_size`. If this happens often, consider increasing `result_state_size`.
 * `pg_alloc_reader` - counts the number of bytes allocated while reading messages from PostgreSQL. This generally happens as a result of large result (e.g. selecting large text fields). Controlled by the `read_buffer` configuration option.
 
-## TLS (Experimental)
-TLS is supported via openssl. When loading the module, you must enable openssl by including at least 1 openssl setting:
+## TLS
+This fork doesn't link OpenSSL. TLS comes from a `tls` module chosen with the `tls` build option:
+
+* `none` (the default): no TLS. `.tls = .prefer` connects in plain text, any other mode fails with `error.TlsNotAvailable`.
+* `std`: Zig's `std.crypto.tls` (`src/std_tls.zig`). Nothing to install, but it has std's limits: no client certificates, no ALPN (so no direct TLS) and no `verify_ca`.
+* `injected`: the application provides the module:
 
 ```zig
-const pg_module = b.dependency("pg", .{
-  .target = target,
-  .optimize = optimize,
-  .openssl_lib_name = @as([]const u8, "ssl"),
-  .openssl_lib_path = std.Build.LazyPath{.cwd_relative = "/path/to/openssl/lib"},
-  .openssl_include_path = std.Build.LazyPath{.cwd_relative = "/path/to/openssl/include"},
-}).module("pg")
+const pg_dep = b.dependency("pg", .{ .target = target, .optimize = optimize, .tls = .injected });
+pg_dep.module("pg").addImport("tls", my_tls_module);
 ```
 
-When not specified, the system defaults are use for the library and include paths. These should only be set if openssl is installed in a non-default location. In most cases specifying `.openssl_lib_name = "ssl"` or, for some systems `.openssl_lib_name = "openssl"` should be enough.
+Whatever the module, it reads and writes the socket through `std.Io`, so a TLS connection waits (and can be canceled or time out) like a plain one. What a module must provide is described above `TlsHandshake` in [src/stream.zig](src/stream.zig): a `client(input, output, handshake)` function that runs the handshake over the socket's `std.Io.Reader` and `std.Io.Writer`, and a `Connection` with `reader`, `writer`, `close` and `deinit`. A module can also declare a `Config` type, which becomes the connection option `tls_config` (for example to carry a client certificate).
 
-Set the connection's `tls` option to either `.required` or `.{verify_full = null}`. When using a custom root certificate, specify the path: `.{verify_full = "/path/to/root.crt"}`.
+The connection's `tls` option follows libpq's `sslmode`:
+
+* `.off` - no TLS.
+* `.prefer` - TLS if the server supports it (and pg.zig was built with TLS), else plain text.
+* `.require` - TLS, without verifying the server's certificate.
+* `.{ .verify_ca = path }` - TLS, verifying the server's certificate chain against the PEM file `path` (`null` for the module's default, e.g. the system's trust store).
+* `.{ .verify_full = path }` - as `verify_ca`, and the certificate must be for the host connected to.
+
+`tls_direct = true` (PostgreSQL 17+) starts TLS at once, with ALPN `postgresql`, instead of asking the server first with an SSLRequest, which saves a round trip. TLS is never used over a unix socket, as with libpq.
 
 ```zig
-var pool = try pg.Pool.init(allocator, .{
-  .connect = .{ .port = 5432, .host = "ip_or_hostname", .tls = .{.verify_full = null}},
+var pool = try pg.Pool.init(io, allocator, .{
+  .connect = .{ .port = 5432, .host = "ip_or_hostname", .tls = .{.verify_full = "/path/to/root.crt"}},
   .auth = .{ .... },
   .size = 5,
 });
 
 // OR
-const uri = try std.Uri.parse("postgresql://user:password@hostname/DBNAME?sslmode=require");
-var pool = try pg.Pool.initUri(allocator, uri, 10, 5_000);
+const uri = try std.Uri.parse("postgresql://user:password@hostname/DBNAME?sslmode=verify-full&sslrootcert=/path/to/root.crt");
+var pool = try pg.Pool.initUri(io, allocator, uri, .{ .size = 10 });
 ```
 
-In your main file, you can define a global `pub const pg_stderr_tls = true;` to have pg.zig print possible TLS-related errors to stderr. Alternatively, if you get an error, you `pg.printSSLError();` to hopefully print an error message to stderr which can be included in a ticket. This can safely be called in a `catch` clause, and will display nothing if the error is NOT SSL-related. Note that using the global `pg_stderr_tls` is more likely to print useful information in the case of certification verification problems.
+URIs take `sslmode` (`disable`, `prefer`, `require`, `verify-ca`, `verify-full`), `sslrootcert` (a path, or `system`, which means `verify-full` against the system's trust store; any other path turns `require` into `verify-ca`, as in libpq), `sslnegotiation` (`postgres` or `direct`) and `application_name`.
 
 ## Enabling Column Names by Default
 

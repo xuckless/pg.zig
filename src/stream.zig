@@ -2,7 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const lib = @import("lib.zig");
 
-const openssl = lib.openssl;
+const tls = lib.tls;
+const has_tls = lib.has_tls;
 
 const posix = std.posix;
 
@@ -12,157 +13,91 @@ const Io = std.Io;
 
 const DEFAULT_HOST = "127.0.0.1";
 
-pub const Stream = if (lib.has_openssl) TLSStream else PlainStream;
+// The SSLRequest message: length 8, then the code 80877103.
+const ssl_request = [_]u8{ 0, 0, 0, 8, 4, 210, 22, 47 };
 
-const TLSStream = struct {
-    valid: bool,
-    ssl: ?*openssl.SSL,
-    stream: Io.net.Stream,
-    io: Io,
-    read_timeout: Io.Timeout = .none,
+// What a TLS connection offers in ALPN. PostgreSQL 17+ requires it for
+// direct TLS, and checks it, when it's sent, after an SSLRequest.
+const alpn_protocols: []const []const u8 = &.{"postgresql"};
 
-    pub fn connect(io: Io, allocator: Allocator, opts: Conn.Opts, ctx_: ?*openssl.SSL_CTX) !Stream {
-        const plain = try PlainStream.connect(io, allocator, opts, null);
-        errdefer plain.close();
-
-        const stream = plain.stream;
-
-        var ssl: ?*openssl.SSL = null;
-        if (ctx_) |ctx| {
-            // PostgreSQL TLS starts off as a plain connection which we upgrade
-            try writeStream(stream, io, &.{ 0, 0, 0, 8, 4, 210, 22, 47 });
-            var buf = [1]u8{0};
-            _ = try readStream(stream, io, &buf, .none);
-            if (buf[0] != 'S') {
-                return error.SSLNotSupportedByServer;
-            }
-
-            ssl = openssl.SSL_new(ctx) orelse return error.SSLNewFailed;
-            errdefer openssl.SSL_free(ssl);
-
-            if (opts.host) |host| {
-                if (isHostName(host)) {
-                    // don't send this for an ip address
-                    var owned = false;
-                    const h = opts._hostz orelse blk: {
-                        owned = true;
-                        break :blk try allocator.dupeSentinel(u8, host, 0);
-                    };
-
-                    defer if (owned) {
-                        allocator.free(h);
-                    };
-
-                    if (openssl.SSL_set_tlsext_host_name(ssl, h.ptr) != 1) {
-                        return error.SSLHostNameFailed;
-                    }
-                }
-                switch (opts.tls) {
-                    .verify_full => openssl.SSL_set_verify(ssl, openssl.SSL_VERIFY_PEER, null),
-                    else => {},
-                }
-            }
-
-            if (openssl.SSL_set_fd(ssl, if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(stream.socket.handle)) else stream.socket.handle) != 1) {
-                return error.SSLSetFdFailed;
-            }
-
-            {
-                const ret = openssl.SSL_connect(ssl);
-                if (ret != 1) {
-                    const verification_code = openssl.SSL_get_verify_result(ssl);
-                    if (comptime lib._stderr_tls) {
-                        lib.printSSLError();
-                    }
-                    if (verification_code != openssl.X509_V_OK) {
-                        if (comptime lib._stderr_tls) {
-                            std.debug.print("ssl verification error: {s}\n", .{openssl.X509_verify_cert_error_string(verification_code)});
-                        }
-                        return error.SSLCertificationVerificationError;
-                    }
-                    return error.SSLConnectFailed;
-                }
-            }
-        }
-
-        return .{
-            .ssl = ssl,
-            .valid = true,
-            .stream = stream,
-            .io = io,
-        };
-    }
-
-    pub fn close(self: *Stream) void {
-        if (self.ssl) |ssl| {
-            if (self.valid) {
-                _ = openssl.SSL_shutdown(ssl);
-                self.valid = false;
-            }
-            openssl.SSL_free(ssl);
-        }
-        self.stream.close(self.io);
-    }
-
-    pub fn shutdown(self: *const Stream, how: Io.net.ShutdownHow) !void {
-        return self.stream.shutdown(self.io, how);
-    }
-
-    // OpenSSL reads the socket itself, so its reads are bounded with
-    // SO_RCVTIMEO rather than through Io.
-    pub fn setReadTimeout(self: *Stream, timeout_ms: ?u32) !void {
-        self.read_timeout = toTimeout(timeout_ms);
-        if (self.ssl != null) {
-            const ms = timeout_ms orelse 0;
-            const timeval = posix.timeval{
-                .sec = @intCast(@divTrunc(ms, 1000)),
-                .usec = @intCast(@mod(ms, 1000) * 1000),
-            };
-            try setsockopt(self.stream.socket.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeval));
-        }
-    }
-
-    pub fn writeAll(self: *Stream, data: []const u8) !void {
-        if (self.ssl) |ssl| {
-            const result = openssl.SSL_write(ssl, data.ptr, @intCast(data.len));
-            if (result <= 0) {
-                self.valid = false;
-                return error.SSLWriteFailed;
-            }
-            return;
-        }
-        return writeStream(self.stream, self.io, data);
-    }
-
-    pub fn read(self: *Stream, buf: []u8) !usize {
-        if (self.ssl) |ssl| {
-            var read_len: usize = undefined;
-            const result = openssl.SSL_read_ex(ssl, buf.ptr, @intCast(buf.len), &read_len);
-            if (result <= 0) {
-                self.valid = false;
-                if (self.read_timeout != .none and openssl.SSL_get_error(ssl, result) == openssl.SSL_ERROR_WANT_READ) {
-                    // SO_RCVTIMEO expired
-                    return error.Timeout;
-                }
-                return error.SSLReadFailed;
-            }
-            return read_len;
-        }
-
-        return readStream(self.stream, self.io, buf, self.read_timeout);
-    }
+pub const TlsMode = enum {
+    // encrypt, but don't verify the server's certificate
+    require,
+    // verify the server's certificate chain, but not its name
+    verify_ca,
+    // verify the server's certificate chain and that it was issued for the host
+    verify_full,
 };
 
-const PlainStream = struct {
+// What the `tls` module's `client` function is given, besides the socket's
+// reader and writer. A module (see build.zig) declares:
+//
+//   pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, handshake: anytype) !Connection
+//   pub const Connection = struct {
+//       pub fn reader(self: *Connection, buffer: []u8) R // R has `interface: std.Io.Reader`
+//       pub fn writer(self: *Connection, buffer: []u8) W // W has `interface: std.Io.Writer`
+//       pub fn close(self: *Connection) void // sends close_notify, best effort
+//       pub fn deinit(self: *Connection) void
+//   };
+//
+// and optionally:
+//
+//   pub const Config = struct { ... } // Conn.Opts.tls_config; `.{}` must be valid
+//   pub const input_buffer_len: usize // buffer of the socket reader it's given
+//   pub const output_buffer_len: usize // buffer of the socket writer it's given
+//
+// `client` runs the handshake over `input` and `output`, which read and write
+// the socket through Io and report socket errors (including error.Timeout and
+// error.Canceled) as error.ReadFailed/WriteFailed; the Stream recovers the
+// cause. The Connection must stay where it is once `reader` or `writer` has
+// been called: the Stream keeps it at a stable address.
+pub const TlsHandshake = struct {
     io: Io,
-    stream: Io.net.Stream,
-    read_timeout: Io.Timeout = .none,
+    allocator: Allocator,
+    // The server's name: for SNI (when it's not an IP address) and, with
+    // verify_full, for checking its certificate.
+    host: []const u8,
+    mode: TlsMode,
+    // A PEM file of trusted root certificates (sslrootcert). null: the
+    // module's default, e.g. the system's trust store or something in
+    // `config`.
+    root_cert: ?[]const u8,
+    // To offer in ALPN.
+    alpn: []const []const u8,
+    // Direct TLS (sslnegotiation=direct): no SSLRequest came first, and the
+    // server only accepts a client that offers ALPN "postgresql".
+    direct: bool,
+    config: *const lib.TlsConfig,
+};
 
-    pub fn connect(io: Io, _: Allocator, opts: Conn.Opts, _: anytype) !PlainStream {
+// A connection to the server: a socket and, when the connection uses TLS,
+// the TLS session on top of it. A small handle to state on the heap, so it
+// can be copied (the Reader keeps a copy); `close` frees it.
+pub const Stream = struct {
+    inner: *Inner,
+
+    const Inner = struct {
+        io: Io,
+        allocator: Allocator,
+        net: Io.net.Stream,
+        socket_reader: SocketReader,
+        socket_writer: Io.net.Stream.Writer,
+        tls: if (has_tls) ?TlsState else void,
+        // socket_reader's and socket_writer's buffers, when TLS uses them
+        buffers: []u8,
+    };
+
+    const TlsState = if (has_tls) struct {
+        conn: tls.Connection,
+        reader: ReaderOf(tls.Connection),
+        writer: WriterOf(tls.Connection),
+    } else void;
+
+    pub fn connect(io: Io, allocator: Allocator, opts: Conn.Opts) !Stream {
         const host = opts.host orelse DEFAULT_HOST;
         const is_unix = host.len > 0 and host[0] == '/';
 
-        const stream = try blk: {
+        const net = try blk: {
             if (is_unix) {
                 if (comptime Io.net.has_unix_sockets == false or std.posix.AF == void) {
                     return error.UnixPathNotSupported;
@@ -174,38 +109,291 @@ const PlainStream = struct {
             const hostname: Io.net.HostName = try .init(host);
             break :blk hostname.connect(io, port, .{ .mode = .stream });
         };
-        errdefer stream.close(io);
+        errdefer net.close(io);
 
         if (is_unix == false) {
-            try setKeepalive(stream.socket.handle, opts);
+            try setKeepalive(net.socket.handle, opts);
         }
 
+        const inner = try allocator.create(Inner);
+        errdefer allocator.destroy(inner);
+        inner.* = .{
+            .io = io,
+            .allocator = allocator,
+            .net = net,
+            .socket_reader = .init(io, net.socket.handle, &.{}),
+            .socket_writer = net.writer(io, &.{}),
+            .tls = if (has_tls) null else {},
+            .buffers = &.{},
+        };
+        const stream = Stream{ .inner = inner };
+        errdefer allocator.free(inner.buffers);
+
+        // As libpq does, TLS is never used over a unix socket.
+        if (is_unix == false) {
+            try stream.startTls(host, opts);
+        }
+        return stream;
+    }
+
+    fn startTls(self: Stream, host: []const u8, opts: Conn.Opts) !void {
+        const mode: TlsMode, const root_cert: ?[]const u8 = switch (opts.tls) {
+            .off => return,
+            .prefer => if (comptime has_tls) .{ .require, null } else return,
+            .require => .{ .require, null },
+            .verify_ca => |path| .{ .verify_ca, path },
+            .verify_full => |path| .{ .verify_full, path },
+        };
+        if (comptime has_tls == false) {
+            return error.TlsNotAvailable;
+        }
+
+        const inner = self.inner;
+        const io = inner.io;
+        if (opts.tls_direct == false) {
+            // PostgreSQL TLS starts off as a plain connection which we upgrade
+            try self.writeAll(&ssl_request);
+            // Exactly one byte: anything the server sent after it, before the
+            // handshake, must not be taken as coming from inside TLS.
+            var answer = [1]u8{0};
+            if (try inner.socket_reader.readOnce(&answer) == 0) {
+                return error.Closed;
+            }
+            switch (answer[0]) {
+                'S' => {},
+                'N' => if (opts.tls == .prefer) return else return error.TlsNotSupportedByServer,
+                else => return error.UnexpectedDBMessage,
+            }
+        }
+
+        const input_len: usize = if (@hasDecl(tls, "input_buffer_len")) tls.input_buffer_len else 0;
+        const output_len: usize = if (@hasDecl(tls, "output_buffer_len")) tls.output_buffer_len else 0;
+        const allocator = inner.allocator;
+        inner.buffers = try allocator.alloc(u8, input_len + output_len);
+        inner.socket_reader.interface.buffer = inner.buffers[0..input_len];
+        inner.socket_writer = inner.net.writer(io, inner.buffers[input_len..]);
+
+        const handshake = TlsHandshake{
+            .io = io,
+            .allocator = allocator,
+            .host = host,
+            .mode = mode,
+            .root_cert = root_cert,
+            .alpn = alpn_protocols,
+            .direct = opts.tls_direct,
+            .config = &opts.tls_config,
+        };
+        inner.tls = .{
+            .conn = tls.client(&inner.socket_reader.interface, &inner.socket_writer.interface, handshake) catch |err| {
+                return self.socketError(err);
+            },
+            .reader = undefined,
+            .writer = undefined,
+        };
+        const state = &inner.tls.?;
+        errdefer {
+            state.conn.deinit();
+            inner.tls = null;
+        }
+        if (comptime @hasField(tls.Connection, "alpn_protocol")) {
+            if (opts.tls_direct and !std.mem.eql(u8, state.conn.alpn_protocol orelse "", "postgresql")) {
+                return error.TlsAlpnNotNegotiated;
+            }
+        }
+        state.reader = state.conn.reader(&.{});
+        state.writer = state.conn.writer(&.{});
+    }
+
+    // Whether the connection uses TLS.
+    pub fn isTls(self: Stream) bool {
+        if (comptime has_tls == false) return false;
+        return self.inner.tls != null;
+    }
+
+    pub fn close(self: Stream) void {
+        const inner = self.inner;
+        const io = inner.io;
+        if (comptime has_tls) {
+            if (inner.tls) |*state| {
+                // best effort, and not something a cancel should interrupt
+                const prev = io.swapCancelProtection(.blocked);
+                state.conn.close();
+                _ = io.swapCancelProtection(prev);
+                state.conn.deinit();
+            }
+        }
+        inner.net.close(io);
+        const allocator = inner.allocator;
+        allocator.free(inner.buffers);
+        allocator.destroy(inner);
+    }
+
+    pub fn shutdown(self: Stream, how: Io.net.ShutdownHow) !void {
+        const inner = self.inner;
+        return inner.net.shutdown(inner.io, how);
+    }
+
+    // Bounds each following read (null or 0: no timeout). A read that waits
+    // longer fails with error.Timeout.
+    pub fn setReadTimeout(self: Stream, timeout_ms: ?u32) !void {
+        self.inner.socket_reader.timeout = toTimeout(timeout_ms);
+    }
+
+    pub fn writeAll(self: Stream, data: []const u8) !void {
+        const inner = self.inner;
+        inner.socket_writer.err = null;
+        if (comptime has_tls) {
+            if (inner.tls) |*state| {
+                const w = &state.writer.interface;
+                w.writeAll(data) catch |err| return self.socketError(err);
+                w.flush() catch |err| return self.socketError(err);
+                return;
+            }
+        }
+        const w = &inner.socket_writer.interface;
+        w.writeAll(data) catch return inner.socket_writer.err orelse error.WriteFailed;
+        w.flush() catch return inner.socket_writer.err orelse error.WriteFailed;
+    }
+
+    // Reads at least 1 byte into buf, or returns 0 when the server closed the
+    // connection.
+    pub fn read(self: Stream, buf: []u8) !usize {
+        const inner = self.inner;
+        if (comptime has_tls) {
+            if (inner.tls) |*state| {
+                inner.socket_reader.err = null;
+                var vecs = [1][]u8{buf};
+                while (true) {
+                    // 0 means it filled the reader's own buffer instead (it
+                    // has none, but that's for the module to decide)
+                    const n = state.reader.interface.readVec(&vecs) catch |err| switch (err) {
+                        error.EndOfStream => return 0,
+                        error.ReadFailed => return self.socketError(err),
+                    };
+                    if (n > 0) return n;
+                }
+            }
+        }
+        return inner.socket_reader.readOnce(buf);
+    }
+
+    // A TLS module reports socket errors as ReadFailed/WriteFailed (and its
+    // own errors as anything else). The socket reader and writer kept the
+    // cause, which is what callers care about: error.Timeout, error.Canceled,
+    // error.ConnectionResetByPeer...
+    fn socketError(self: Stream, err: anytype) SocketError(@TypeOf(err)) {
+        const inner = self.inner;
+        if (@as(anyerror, err) == error.ReadFailed) {
+            if (inner.socket_reader.err) |e| return e;
+            return error.TlsReadFailed;
+        }
+        if (@as(anyerror, err) == error.WriteFailed) {
+            if (inner.socket_writer.err) |e| return e;
+            return error.TlsWriteFailed;
+        }
+        return err;
+    }
+
+    fn SocketError(comptime E: type) type {
+        return E || SocketReader.Error || Io.net.Stream.Writer.Error || error{ TlsReadFailed, TlsWriteFailed };
+    }
+};
+
+// The TLS module's reader and writer types.
+fn ReaderOf(comptime C: type) type {
+    return @typeInfo(@TypeOf(C.reader)).@"fn".return_type.?;
+}
+
+fn WriterOf(comptime C: type) type {
+    return @typeInfo(@TypeOf(C.writer)).@"fn".return_type.?;
+}
+
+// Reads the socket through Io, every read bounded by `timeout`. As an
+// Io.Reader, it's what a TLS module reads ciphertext from; on a plain
+// connection, `readOnce` reads straight into the caller's buffer.
+const SocketReader = struct {
+    io: Io,
+    handle: Io.net.Socket.Handle,
+    timeout: Io.Timeout = .none,
+    // the cause of the last error.ReadFailed
+    err: ?Error = null,
+    interface: Io.Reader,
+
+    const Error = Io.net.Stream.Reader.Error || Io.Timeout.Error || Io.ConcurrentError;
+
+    fn init(io: Io, handle: Io.net.Socket.Handle, buffer: []u8) SocketReader {
         return .{
             .io = io,
-            .stream = stream,
+            .handle = handle,
+            .interface = .{
+                .vtable = &.{
+                    .stream = streamImpl,
+                    .readVec = readVec,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
         };
     }
 
-    pub fn close(self: *const PlainStream) void {
-        self.stream.close(self.io);
+    // Reads into buf, without going through the interface's buffer. 0 means
+    // the server closed the connection.
+    fn readOnce(self: *SocketReader, buf: []u8) Error!usize {
+        var vecs = [1][]u8{buf};
+        return self.readSocket(&vecs);
     }
 
-    pub fn shutdown(self: *const PlainStream, how: Io.net.ShutdownHow) !void {
-        return self.stream.shutdown(self.io, how);
+    fn readSocket(self: *SocketReader, data: [][]u8) Error!usize {
+        const io = self.io;
+        const op: Io.Operation = .{ .net_read = .{ .socket_handle = self.handle, .data = data } };
+        const result = if (self.timeout == .none)
+            try io.operate(op)
+        else
+            try io.operateTimeout(op, self.timeout);
+        return (try result.net_read).data_len;
     }
 
-    pub fn setReadTimeout(self: *PlainStream, timeout_ms: ?u32) !void {
-        self.read_timeout = toTimeout(timeout_ms);
+    fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
     }
 
-    pub fn writeAll(self: *const PlainStream, data: []const u8) !void {
-        return writeStream(self.stream, self.io, data);
-    }
-
-    pub fn read(self: *const PlainStream, buf: []u8) !usize {
-        return readStream(self.stream, self.io, buf, self.read_timeout);
+    fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const self: *SocketReader = @alignCast(@fieldParentPtr("interface", io_r));
+        var iovecs_buffer: [8][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs_buffer, data);
+        const n = self.readSocket(iovecs_buffer[0..dest_n]) catch |err| {
+            self.err = err;
+            return error.ReadFailed;
+        };
+        if (n == 0) {
+            return error.EndOfStream;
+        }
+        if (n > data_size) {
+            io_r.end += n - data_size;
+            return data_size;
+        }
+        return n;
     }
 };
+
+fn toTimeout(timeout_ms: ?u32) Io.Timeout {
+    const ms = timeout_ms orelse return .none;
+    if (ms == 0) return .none;
+    return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+}
+
+// Sends a best-effort Terminate ('X') message, shielded from cancellation so
+// teardown can't be interrupted.
+pub fn sendTerminate(stream: *Stream, io: Io) void {
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+    stream.writeAll(&.{ 'X', 0, 0, 0, 4 }) catch {};
+}
 
 const TCP = switch (builtin.os.tag) {
     // Zig doesn't expose these /shrug
@@ -312,56 +500,5 @@ fn setsockopt(fd: posix.socket_t, level: i32, optname: u32, opt: []const u8) !vo
     }
 }
 
-fn toTimeout(timeout_ms: ?u32) Io.Timeout {
-    const ms = timeout_ms orelse return .none;
-    if (ms == 0) return .none;
-    return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
-}
-
-fn readStream(stream: Io.net.Stream, io: Io, buf: []u8, timeout: Io.Timeout) !usize {
-    var vecs: [1][]u8 = .{buf};
-    if (timeout != .none) {
-        // A read that waits longer than the timeout fails with error.Timeout.
-        const result = (try io.operateTimeout(.{ .net_read = .{
-            .socket_handle = stream.socket.handle,
-            .data = &vecs,
-        } }, timeout)).net_read;
-        return (try result).data_len;
-    }
-    var reader = stream.reader(io, &.{});
-    const r = &reader.interface;
-    return r.readVec(&vecs) catch |err| switch (err) {
-        error.ReadFailed => return reader.err orelse err,
-        else => return err,
-    };
-}
-
-fn writeStream(stream: Io.net.Stream, io: Io, data: []const u8) !void {
-    var buf: [1024]u8 = undefined;
-    var writer = stream.writer(io, &buf);
-    const w = &writer.interface;
-    w.writeAll(data) catch |err| switch (err) {
-        error.WriteFailed => return writer.err orelse err,
-    };
-    w.flush() catch |err| switch (err) {
-        error.WriteFailed => return writer.err orelse err,
-    };
-}
-
-// Sends a best-effort Terminate ('X') message, shielded from cancellation so
-// teardown can't be interrupted.
-pub fn sendTerminate(stream: *Stream, io: Io) void {
-    const prev = io.swapCancelProtection(.blocked);
-    defer _ = io.swapCancelProtection(prev);
-    stream.writeAll(&.{ 'X', 0, 0, 0, 4 }) catch {};
-}
-
-fn isHostName(host: []const u8) bool {
-    if (std.mem.findScalar(u8, host, ':') != null) {
-        // IPv6
-        return false;
-    }
-    return std.mem.findNone(u8, host, "0123456789.") != null;
-}
 
 const windows = @import("windows.zig");

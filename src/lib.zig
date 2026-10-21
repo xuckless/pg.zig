@@ -1,7 +1,12 @@
 // Exposed within this library
 const std = @import("std");
 
-pub const openssl = @import("openssl");
+// The TLS implementation: injected by the application, or a bundled one, or
+// none (build option `tls`). See TlsHandshake in stream.zig for what it
+// provides.
+pub const tls = @import("tls");
+pub const has_tls = !@hasDecl(tls, "pg_tls_disabled");
+pub const TlsConfig = if (@hasDecl(tls, "Config")) tls.Config else struct {};
 
 const build_config = @import("config");
 
@@ -15,10 +20,10 @@ pub const Stmt = @import("stmt.zig").Stmt;
 pub const StatementCache = @import("statement_cache.zig").StatementCache;
 pub const Pool = @import("pool.zig").Pool;
 pub const Stream = @import("stream.zig").Stream;
+pub const TlsHandshake = @import("stream.zig").TlsHandshake;
+pub const TlsMode = @import("stream.zig").TlsMode;
 pub const sendTerminate = @import("stream.zig").sendTerminate;
 pub const metrics = @import("metrics.zig");
-pub const has_openssl = build_config.openssl;
-pub const SSLCtx = if (has_openssl) openssl.SSL_CTX else void;
 pub const default_column_names = build_config.column_names;
 
 const result = @import("result.zig");
@@ -46,13 +51,6 @@ const _assert = blk: {
         .ReleaseFast, .ReleaseSmall => break :blk false,
         else => break :blk true,
     }
-};
-
-pub const _stderr_tls = blk: {
-    if (@hasDecl(root, "pg_stderr_tls")) {
-        break :blk root.pg_stderr_tls;
-    }
-    break :blk false;
 };
 
 pub fn assert(ok: bool) void {
@@ -150,7 +148,10 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
     errdefer arena.deinit();
     const aa = arena.allocator();
 
-    var tls: Conn.Opts.TLS = .off;
+    var tls_mode: enum { disable, prefer, require, verify_ca, verify_full } = .disable;
+    var root_cert: ?[]const u8 = null;
+    var tls_direct = false;
+    var application_name: ?[]const u8 = null;
     var tcp_user_timeout: ?u32 = null;
     if (uri.query) |qry| {
         const query_string = try qry.toRawMaybeAlloc(aa);
@@ -158,22 +159,49 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
         while (it.next()) |param| {
             var it2 = std.mem.splitScalar(u8, param, '=');
             const key = it2.first();
-            const val = it2.rest();
+            const val = std.Uri.percentDecodeInPlace(try aa.dupe(u8, it2.rest()));
             if (std.mem.eql(u8, key, "tcp_user_timeout")) {
                 tcp_user_timeout = try std.fmt.parseInt(u32, val, 10);
             } else if (std.mem.eql(u8, key, "sslmode")) {
-                if (std.mem.eql(u8, val, "require")) {
-                    tls = .require;
-                } else if (std.mem.eql(u8, val, "verify-full")) {
-                    tls = .{ .verify_full = null };
-                } else if (std.mem.eql(u8, val, "disable") == false) {
+                tls_mode = std.meta.stringToEnum(@TypeOf(tls_mode), val) orelse blk: {
+                    if (std.mem.eql(u8, val, "verify-ca")) break :blk .verify_ca;
+                    if (std.mem.eql(u8, val, "verify-full")) break :blk .verify_full;
                     return error.UnsupportedSSLModeValue;
+                };
+            } else if (std.mem.eql(u8, key, "sslrootcert")) {
+                root_cert = val;
+            } else if (std.mem.eql(u8, key, "sslnegotiation")) {
+                if (std.mem.eql(u8, val, "direct")) {
+                    tls_direct = true;
+                } else if (std.mem.eql(u8, val, "postgres") == false) {
+                    return error.UnsupportedSSLNegotiationValue;
                 }
+            } else if (std.mem.eql(u8, key, "application_name")) {
+                application_name = val;
             } else {
                 return error.UnsupportedConnectionParam;
             }
         }
     }
+
+    // As libpq: sslrootcert=system means the system's trust store and
+    // implies verify-full; with any other root certificate, require means
+    // verify-ca.
+    if (root_cert) |rc| {
+        if (std.mem.eql(u8, rc, "system")) {
+            root_cert = null;
+            tls_mode = .verify_full;
+        } else if (tls_mode == .require) {
+            tls_mode = .verify_ca;
+        }
+    }
+    const tls_opt: Conn.Opts.TLS = switch (tls_mode) {
+        .disable => .off,
+        .prefer => .prefer,
+        .require => .require,
+        .verify_ca => .{ .verify_ca = root_cert },
+        .verify_full => .{ .verify_full = root_cert },
+    };
 
     const path = std.mem.trimStart(u8, try uri.path.toRawMaybeAlloc(aa), "/");
     const host = if (uri.host) |host| try host.toRawMaybeAlloc(aa) else null;
@@ -188,89 +216,15 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
             .password = password,
             .database = if (path.len == 0) null else path,
             .timeout = tcp_user_timeout orelse 10_000,
+            .application_name = application_name,
         },
         .connect = .{
-            .tls = tls,
+            .tls = tls_opt,
+            .tls_direct = tls_direct,
             .port = uri.port orelse null,
             .host = host,
         },
     } };
-}
-
-pub fn initializeSSLContext(config: Conn.Opts.TLS) !*SSLCtx {
-    // OpenSSL documentation says these are implicitly called, and only need to
-    // be called if you're doing something special
-
-    // if (openssl.OPENSSL_init_ssl(openssl.OPENSSL_INIT_LOAD_SSL_STRINGS | openssl.OPENSSL_INIT_LOAD_CRYPTO_STRINGS, null) != 1) {
-    //     return error.OpenSSLInitSslFailed;
-    // }
-
-    // if (openssl.OPENSSL_init_crypto(openssl.OPENSSL_INIT_ADD_ALL_CIPHERS | openssl.OPENSSL_INIT_ADD_ALL_DIGESTS | openssl.OPENSSL_INIT_LOAD_CRYPTO_STRINGS, null) != 1) {
-    //     return error.OpenSSLInitCryptoFailed;
-    // }
-
-    const ctx = openssl.SSL_CTX_new(openssl.TLS_client_method()) orelse {
-        return error.SSLContextNew;
-    };
-    errdefer openssl.SSL_CTX_free(ctx);
-
-    if (openssl.SSL_CTX_set_min_proto_version(ctx, openssl.TLS1_2_VERSION) != 1) {
-        return error.SSLMinVersion;
-    }
-
-    _ = openssl.SSL_CTX_set_mode(ctx, openssl.SSL_MODE_AUTO_RETRY);
-
-    switch (config) {
-        .off, .require => {},
-        .verify_full => |path_to_root| {
-            if (path_to_root) |p| {
-                var pathz: [std.fs.max_path_bytes + 1]u8 = undefined;
-                @memcpy(pathz[0..p.len], p);
-                pathz[p.len] = 0;
-                if (openssl.SSL_CTX_load_verify_locations(ctx, pathz[0 .. p.len + 1].ptr, null) != 1) {
-                    if (comptime _stderr_tls) {
-                        printSSLError();
-                    }
-                    return error.SSLVerifyPaths;
-                }
-            } else {
-                if (openssl.SSL_CTX_set_default_verify_paths(ctx) != 1) {
-                    if (comptime _stderr_tls) {
-                        printSSLError();
-                    }
-                    return error.SSLDefaultVerifyPaths;
-                }
-            }
-            openssl.SSL_CTX_set_verify(ctx, openssl.SSL_VERIFY_PEER, null);
-        },
-    }
-
-    return ctx;
-}
-
-pub fn freeSSLContext(ctx: ?*SSLCtx) void {
-    if (comptime has_openssl == false) {
-        return;
-    }
-
-    if (ctx) |c| {
-        openssl.SSL_CTX_free(c);
-    }
-}
-
-pub fn printSSLError() void {
-    if (comptime has_openssl == false) {
-        return;
-    }
-
-    const bio = openssl.BIO_new(openssl.BIO_s_mem());
-    defer _ = openssl.BIO_free(bio);
-    openssl.ERR_print_errors(bio);
-    var buf: [*]u8 = undefined;
-    const len: usize = @intCast(openssl.BIO_get_mem_data(bio, &buf));
-    if (len > 0) {
-        std.debug.print("{s}\n", .{buf[0..len]});
-    }
 }
 
 pub const Binary = struct {
@@ -316,6 +270,40 @@ test "URI: parse valid" {
         defer po.deinit();
         try std.testing.expectEqualDeep(tc.expected_opts, po.opts);
     }
+}
+
+test "URI: TLS" {
+    const a = std.testing.allocator;
+    const Case = struct { uri: []const u8, tls: Conn.Opts.TLS, direct: bool = false };
+    const cases = [_]Case{
+        .{ .uri = "postgresql:///?sslmode=disable", .tls = .off },
+        .{ .uri = "postgresql:///?sslmode=prefer", .tls = .prefer },
+        .{ .uri = "postgresql:///?sslmode=require", .tls = .require },
+        .{ .uri = "postgresql:///?sslmode=verify-ca", .tls = .{ .verify_ca = null } },
+        .{ .uri = "postgresql:///?sslmode=verify-full", .tls = .{ .verify_full = null } },
+        .{ .uri = "postgresql:///?sslmode=verify-full&sslrootcert=%2Fetc%2Froot.crt", .tls = .{ .verify_full = "/etc/root.crt" } },
+        // as libpq: a root certificate makes require verify the chain
+        .{ .uri = "postgresql:///?sslmode=require&sslrootcert=root.crt", .tls = .{ .verify_ca = "root.crt" } },
+        // and sslrootcert=system means verify-full against the system's store
+        .{ .uri = "postgresql:///?sslrootcert=system", .tls = .{ .verify_full = null } },
+        .{ .uri = "postgresql:///?sslmode=require&sslnegotiation=direct", .tls = .require, .direct = true },
+        .{ .uri = "postgresql:///?sslmode=require&sslnegotiation=postgres", .tls = .require },
+    };
+    for (cases) |tc| {
+        var po = try parseOpts(try std.Uri.parse(tc.uri), a);
+        defer po.deinit();
+        try std.testing.expectEqualDeep(tc.tls, po.opts.connect.tls);
+        try std.testing.expectEqual(tc.direct, po.opts.connect.tls_direct);
+    }
+
+    try std.testing.expectError(error.UnsupportedSSLModeValue, parseOpts(try std.Uri.parse("postgresql:///?sslmode=sometimes"), a));
+    try std.testing.expectError(error.UnsupportedSSLNegotiationValue, parseOpts(try std.Uri.parse("postgresql:///?sslnegotiation=maybe"), a));
+}
+
+test "URI: application_name" {
+    var po = try parseOpts(try std.Uri.parse("postgresql:///?application_name=my%20app"), std.testing.allocator);
+    defer po.deinit();
+    try std.testing.expectEqualStrings("my app", po.opts.auth.application_name.?);
 }
 
 test "URI: invalid scheme" {

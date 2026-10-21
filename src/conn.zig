@@ -7,14 +7,12 @@ const types = lib.types;
 const Pool = lib.Pool;
 const Stmt = lib.Stmt;
 const StatementCache = lib.StatementCache;
-const SSLCtx = lib.SSLCtx;
 const Reader = lib.Reader;
 const Result = lib.Result;
 const Stream = lib.Stream;
 const Timeout = lib.Timeout;
 const QueryRow = lib.QueryRow;
 const QueryRowUnsafe = lib.QueryRowUnsafe;
-const has_openssl = lib.has_openssl;
 
 const os = std.os;
 const Allocator = std.mem.Allocator;
@@ -22,10 +20,6 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const Io = std.Io;
 
 pub const Conn = struct {
-    // If we own the ssl context (which only happens if the connection is
-    // created directly and NOT through a pool), then we have to free it
-    _ssl_ctx: ?*SSLCtx,
-
     // If we get a postgreSQL error, this will be set.
     err: ?proto.Error,
 
@@ -71,9 +65,8 @@ pub const Conn = struct {
     _prepared_statements: std.hash_map.StringHashMapUnmanaged(Stmt.Describe),
 
     // What cancel() needs to reach the server: the options we connected with
-    // (with our own copies of their strings) and the TLS context.
+    // (with our own copies of their strings).
     _connect_opts: Opts,
-    _connect_ssl_ctx: ?*SSLCtx,
 
     // From the server's BackendKeyData. _cancel_key_len == 0 until then.
     _backend_pid: u32 = 0,
@@ -108,7 +101,14 @@ pub const Conn = struct {
         // trip instead of two. 0 disables the cache. See the readme before
         // enabling it behind a connection pooler.
         statement_cache_size: u16 = 0,
-        _hostz: ?[:0]const u8 = null,
+
+        // TLS straight away (PostgreSQL 17+, sslnegotiation=direct), rather
+        // than after asking the server with an SSLRequest. Saves a round trip.
+        tls_direct: bool = false,
+
+        // Whatever else the TLS implementation needs, e.g. a client
+        // certificate (see the `tls` build option).
+        tls_config: lib.TlsConfig = .{},
 
         // tcp keepalive settings (null timer = OS default)
         keepalive: bool = true,
@@ -116,9 +116,16 @@ pub const Conn = struct {
         keepalive_interval: ?u32 = 10,
         keepalive_count: ?u32 = 3,
 
+        // As libpq's sslmode. verify_ca and verify_full take a PEM file of
+        // trusted root certificates (sslrootcert); with null, the TLS
+        // implementation's default (e.g. the system's trust store).
         pub const TLS = union(enum) {
             off: void,
+            // TLS if the server supports it (and pg.zig was built with TLS)
+            prefer: void,
+            // TLS, without verifying the server's certificate
             require: void,
+            verify_ca: ?[]const u8,
             verify_full: ?[]const u8,
         };
     };
@@ -168,27 +175,10 @@ pub const Conn = struct {
     }
 
     pub fn open(io: Io, allocator: Allocator, opts: Opts) !Conn {
-        var ssl_ctx: ?*SSLCtx = null;
-        switch (opts.tls) {
-            .off => {},
-            else => |tls_config| {
-                if (comptime lib.has_openssl == false) {
-                    return error.OpenSSLNotConfigured;
-                }
-                ssl_ctx = try lib.initializeSSLContext(tls_config);
-            },
-        }
-        errdefer lib.freeSSLContext(ssl_ctx);
-        var conn = try openWithContext(io, allocator, opts, ssl_ctx);
-        conn._ssl_ctx = ssl_ctx;
-        return conn;
-    }
-
-    pub fn openWithContext(io: Io, allocator: Allocator, opts: Opts, ssl_ctx: ?*SSLCtx) !Conn {
         const connect_opts = try ownConnectOpts(allocator, opts);
         errdefer freeConnectOpts(allocator, connect_opts);
 
-        var stream = try Stream.connect(io, allocator, opts, ssl_ctx);
+        var stream = try Stream.connect(io, allocator, opts);
         errdefer stream.close();
 
         const buf = try Buffer.init(allocator, @max(opts.write_buffer orelse 2048, 128));
@@ -206,7 +196,6 @@ pub const Conn = struct {
         return .{
             .err = null,
             ._buf = buf,
-            ._ssl_ctx = null,
             ._reader = reader,
             ._stream = stream,
             ._err_data = null,
@@ -217,7 +206,6 @@ pub const Conn = struct {
             ._result_state = result_state,
             ._prepared_statements = .{},
             ._connect_opts = connect_opts,
-            ._connect_ssl_ctx = ssl_ctx,
             ._statement_cache = .init(opts.statement_cache_size),
         };
     }
@@ -233,7 +221,6 @@ pub const Conn = struct {
         self._result_state.deinit(allocator);
 
         lib.sendTerminate(&self._stream, self._io);
-        lib.freeSSLContext(self._ssl_ctx);
         self._stream.close();
 
         var it = self._prepared_statements.valueIterator();
@@ -298,7 +285,7 @@ pub const Conn = struct {
         }
 
         const allocator = self._allocator;
-        var stream = try Stream.connect(self._io, allocator, self._connect_opts, self._connect_ssl_ctx);
+        var stream = try Stream.connect(self._io, allocator, self._connect_opts);
         defer stream.close();
 
         var buf = try Buffer.init(allocator, 12 + key_len);
@@ -716,10 +703,12 @@ pub const Conn = struct {
 // own copies of their strings.
 fn ownConnectOpts(allocator: Allocator, opts: Conn.Opts) !Conn.Opts {
     var owned = opts;
-    owned._hostz = null;
     owned.host = if (opts.host) |h| try allocator.dupe(u8, h) else null;
     errdefer if (owned.host) |h| allocator.free(h);
     switch (opts.tls) {
+        .verify_ca => |path| if (path) |p| {
+            owned.tls = .{ .verify_ca = try allocator.dupe(u8, p) };
+        },
         .verify_full => |path| if (path) |p| {
             owned.tls = .{ .verify_full = try allocator.dupe(u8, p) };
         },
@@ -731,7 +720,7 @@ fn ownConnectOpts(allocator: Allocator, opts: Conn.Opts) !Conn.Opts {
 fn freeConnectOpts(allocator: Allocator, opts: Conn.Opts) void {
     if (opts.host) |h| allocator.free(h);
     switch (opts.tls) {
-        .verify_full => |path| if (path) |p| allocator.free(p),
+        .verify_ca, .verify_full => |path| if (path) |p| allocator.free(p),
         else => {},
     }
 }
@@ -2272,19 +2261,90 @@ test "Conn: TLS required" {
         try t.expectEqual(true, std.mem.find(u8, conn.err.?.message, "no encryption") != null);
     }
 
+    if (comptime lib.has_tls == false) {
+        try t.expectError(error.TlsNotAvailable, Conn.open(t.io, t.allocator, .{ .tls = .require }));
+        return;
+    }
+
     {
         var conn = try t.connect(.{ .tls = Conn.Opts.TLS.require, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
         defer conn.deinit();
+        try t.expectEqual(true, conn._stream.isTls());
+        try t.expectEqual(true, try sslInUse(&conn));
+    }
+}
+
+test "Conn: TLS prefer" {
+    var conn = try Conn.open(t.io, t.allocator, .{ .tls = .prefer });
+    defer conn.deinit();
+    try t.expectEqual(lib.has_tls, conn._stream.isTls());
+    if (comptime lib.has_tls) {
+        // the server takes it, so this user, which must use TLS, gets in
+        try conn.auth(.{ .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw", .database = "postgres" });
+        try t.expectEqual(true, try sslInUse(&conn));
+    } else {
+        try t.expectError(error.PG, conn.auth(.{ .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" }));
     }
 }
 
 test "Conn: TLS verify-full" {
-    try t.expectError(error.SSLCertificationVerificationError, Conn.open(t.io, t.allocator, .{ .tls = .{ .verify_full = null } }));
+    if (comptime lib.has_tls == false) return error.SkipZigTest;
+
+    // not signed by anything in the system's trust store
+    try expectAnyError(Conn.open(t.io, t.allocator, .{ .tls = .{ .verify_full = null } }));
+    // signed by another CA
+    try expectAnyError(Conn.open(t.io, t.allocator, .{ .tls = .{ .verify_full = "tests/other.crt" } }));
 
     {
         var conn = try t.connect(.{ .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
         defer conn.deinit();
+        try t.expectEqual(true, try sslInUse(&conn));
     }
+}
+
+test "Conn: TLS through the pool" {
+    if (comptime lib.has_tls == false) return error.SkipZigTest;
+
+    var pool = try lib.Pool.init(t.io, t.allocator, .{
+        .size = 2,
+        .connect = .{ .host = "127.0.0.1", .tls = .{ .verify_full = "tests/root.crt" } },
+        .auth = .{ .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw", .database = "postgres" },
+    });
+    defer pool.deinit();
+
+    var row = (try pool.row("select ssl from pg_stat_ssl where pid = pg_backend_pid()", .{})).?;
+    defer row.deinit() catch {};
+    try t.expectEqual(true, try row.get(bool, 0));
+}
+
+test "Conn: listener over TLS" {
+    if (comptime lib.has_tls == false) return error.SkipZigTest;
+
+    var l = try @import("listener.zig").Listener.open(t.io, t.allocator, .{ .host = "127.0.0.1", .tls = .require });
+    defer l.deinit();
+    try l.auth(.{ .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw", .database = "postgres" });
+    try l.listen("chan_tls", .{});
+
+    var c = try t.connect(.{});
+    defer c.deinit();
+    _ = try c.exec("select pg_notify('chan_tls', 'over tls')", .{});
+
+    const notification = l.next().?;
+    try t.expectString("over tls", notification.payload);
+}
+
+fn sslInUse(c: *Conn) !bool {
+    var row = (try c.row("select ssl from pg_stat_ssl where pid = pg_backend_pid()", .{})).?;
+    defer row.deinit() catch {};
+    return row.get(bool, 0);
+}
+
+fn expectAnyError(result: anytype) !void {
+    if (result) |value| {
+        var v = value;
+        v.deinit();
+        return error.ExpectedAnError;
+    } else |_| {}
 }
 
 test "Conn: query is cancelable" {
@@ -2347,6 +2407,7 @@ test "Conn: exec timeout" {
 }
 
 test "Conn: query timeout over TLS" {
+    if (comptime lib.has_tls == false) return error.SkipZigTest;
     var conn = try t.connect(.{ .tls = Conn.Opts.TLS.require, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
     defer conn.deinit();
 
@@ -2374,6 +2435,7 @@ test "Conn: cancel" {
 }
 
 test "Conn: cancel over TLS" {
+    if (comptime lib.has_tls == false) return error.SkipZigTest;
     try testCancel(.{ .tls = Conn.Opts.TLS.require, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
 }
 
