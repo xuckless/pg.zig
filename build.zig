@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) !void {
     const dep_opts = .{ .target = target, .optimize = optimize };
 
     const tls = b.option(Tls, "tls", "TLS implementation: none (default), std or injected");
+    const metrics = b.option(bool, "metrics", "Count queries and allocations with metrics.zig (pg.writeMetrics); off by default") orelse false;
 
     // Expose this as a module that others can import
     const pg_module = b.addModule("pg", .{
@@ -27,10 +28,10 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/pg.zig"),
         .imports = &.{
             .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
-            .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
         },
     });
     addTls(b, pg_module, tls orelse .none);
+    addMetrics(b, pg_module, metrics, dep_opts);
 
     var column_names = false;
     const column_names_opt = b.option(bool, "column_names", "");
@@ -56,10 +57,10 @@ pub fn build(b: *std.Build) !void {
             .root_source_file = b.path("src/pg.zig"),
             .imports = &.{
                 .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
-                .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
             },
         });
         addTls(b, test_module, test_tls);
+        addMetrics(b, test_module, metrics, dep_opts);
 
         const lib_test = b.addTest(.{
             .root_module = test_module,
@@ -78,6 +79,16 @@ pub fn build(b: *std.Build) !void {
 
         const test_step = b.step("test", "Run unit tests");
         test_step.dependOn(&run_test.step);
+    }
+}
+
+fn addMetrics(b: *std.Build, module: *std.Build.Module, enabled: bool, dep_opts: anytype) void {
+    if (enabled) {
+        if (b.lazyDependency("metrics", dep_opts)) |dep| {
+            module.addImport("metrics", dep.module("metrics"));
+        }
+    } else {
+        module.addAnonymousImport("metrics", .{ .root_source_file = b.path("src/metrics_stub.zig") });
     }
 }
 

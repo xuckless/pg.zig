@@ -661,6 +661,8 @@ The handling of errors isn't great. Blame Zig's lack of error payloads and the a
 `listener.next()` can only return `null` on error. When `null` is returned, `listener.err` will be non-null. Unlike the `Conn` this is a tagged union that can either be `err` for a normal Zig error (e.g. error.ConnectionResetByPeer) or `pg` a detailed PostgresSQL error.
 
 ## Metrics
+In this fork, metrics are off unless pg.zig is built with `-Dmetrics=true` (`b.dependency("pg", .{ .metrics = true })`); otherwise `pg.writeMetrics` writes nothing. The counters are process-wide, so every connection, on every thread, updates the same cache line. `pool.stats()` and `conn.statementCacheStats()` work either way.
+
 A few basic metrics are collected using [metrics.zig](https://github.com/karlseguin/metrics.zig), a prometheus-compatible library. These can be written to an `std.io.Writer` using `try pg.writeMetrics(writer)`. As an example using [httpz](https://github.com/karlseguin/http.zig):
 
 ```zig
