@@ -621,11 +621,13 @@ pub const Conn = struct {
             };
             switch (msg.type) {
                 'Z' => {
+                    if (msg.data.len == 0) return self.unexpectedDBMessage();
                     self._state = switch (msg.data[0]) {
                         'I' => .idle,
                         'T' => .transaction,
                         'E' => .fail,
-                        else => unreachable,
+                        // a server doesn't send anything else
+                        else => return self.unexpectedDBMessage(),
                     };
                     return msg;
                 },

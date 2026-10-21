@@ -72,6 +72,17 @@ Initializes a connection pool. Pool options are:
 * `max_lifetime` - Milliseconds, from when it was opened, after which a connection is closed instead of being reused: when it's released, or found idle by `acquire`. Useful behind a load balancer or a failover, so that connections don't stick to one server forever. Defaults to `null` (no limit).
 * `idle_timeout` - Milliseconds a connection may sit idle in the pool before it's closed. The pool has no background task: expired connections are closed (a few at a time) when the pool is next used, by `acquire` or `release`. Defaults to `null` (no limit).
 
+When `acquire()` opens a connection and the server refuses it (a wrong password, a database that doesn't exist), it returns `error.PG`, and the connection that had the server's error is gone. `acquireOpts` can keep that error:
+
+```zig
+var ce = pg.Pool.ConnectError{ .allocator = allocator };
+defer ce.deinit();
+const conn = pool.acquireOpts(.{ .connect_error = &ce }) catch |err| {
+    if (ce.err) |pg_err| std.log.err("cannot connect: {s} ({s})", .{ pg_err.message, pg_err.code });
+    return err;
+};
+```
+
 ### initUri(io: std.Io, allocator: std.mem.Allocator, uri: std.Uri, opts: Opts) !\*Pool
 Initializes a connection pool using a std.Uri. When using this function, the `auth` and `connect` fields of `opts` should **not** be set, as these will automatically set based on the provided `uri`.
 
