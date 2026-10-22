@@ -217,6 +217,13 @@ pub const Conn = struct {
         // cache (Opts.statement_cache_size). Set to false for one-off SQL so
         // that it doesn't push out statements that are reused.
         statement_cache: bool = true,
+
+        // Ask for every column in PostgreSQL's text format, as psql prints
+        // it (row values hold that text, whatever the type), instead of the
+        // binary format for the types this library decodes. For callers that
+        // hand values on to code that parses PostgreSQL's text output (a
+        // binding's type parsers), and for types with no decoder here.
+        text_results: bool = false,
     };
 
     pub fn openAndAuthUri(io: Io, allocator: Allocator, uri: std.Uri) !Conn {
@@ -486,8 +493,14 @@ pub const Conn = struct {
                 return error.WrongNumberOfParameters;
             }
 
-            inline for (values) |value| {
-                try stmt.bind(value);
+            if (comptime @typeInfo(@TypeOf(values)) == .pointer) {
+                // A slice: values whose number is known at run time (each
+                // a tagged union, say; see `types.bindValue`).
+                for (values) |value| try stmt.bind(value);
+            } else {
+                inline for (values) |value| {
+                    try stmt.bind(value);
+                }
             }
         }
 
@@ -949,6 +962,46 @@ test "Conn: exec with values rowsAffected" {
         const n = try c.exec("insert into simple_table values ($1), ($2)", .{ "exec_insert_args_a", "exec_insert_args_b" });
         try t.expectEqual(2, n.?);
     }
+}
+
+test "Conn: values as a slice of tagged unions" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+    const V = union(enum) { null, int: i64, float: f64, text: []const u8, bool: bool, binary: lib.Binary };
+    {
+        // numbers into numeric and text parameters go as text
+        const values = [_]V{ .{ .int = 7 }, .{ .float = 2.5 }, .{ .int = 3 }, .{ .text = "x" }, .null, .{ .bool = true }, .{ .binary = .{ .data = "\x00\x01" } } };
+        var row = (try c.row("select $1::int8 + 1, $2::numeric::text, $3::text, $4::text, $5::int4 is null, $6::bool, $7::bytea", @as([]const V, &values))).?;
+        defer row.deinit() catch {};
+        try t.expectEqual(8, try row.get(i64, 0));
+        try t.expectString("2.5", try row.get([]const u8, 1));
+        try t.expectString("3", try row.get([]const u8, 2));
+        try t.expectString("x", try row.get([]const u8, 3));
+        try t.expectEqual(true, try row.get(bool, 4));
+        try t.expectEqual(true, try row.get(bool, 5));
+        try t.expectString("\x00\x01", try row.get([]const u8, 6));
+    }
+    {
+        const values = [_]V{ .{ .text = "dyn_a" }, .{ .text = "dyn_b" } };
+        try t.expectEqual(2, (try c.exec("insert into simple_table values ($1), ($2)", @as([]const V, &values))).?);
+        try t.expectError(error.WrongNumberOfParameters, c.exec("insert into simple_table values ($1)", @as([]const V, &values)));
+    }
+}
+
+test "Conn: text results" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+    var result = try c.queryOpts("select 42::int8, true, '\\x0102'::bytea, null::text, array[1,2], 1.50::numeric", .{}, .{ .text_results = true });
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectString("42", row.values[0].data);
+    try t.expectString("t", row.values[1].data);
+    try t.expectString("\\x0102", row.values[2].data);
+    try t.expectEqual(true, row.values[3].is_null);
+    try t.expectString("{1,2}", row.values[4].data);
+    try t.expectString("1.50", row.values[5].data);
+    try t.expectEqual(20, result._oids[0]);
+    try t.expectEqual(null, try result.next());
 }
 
 test "Conn: exec query that returns rows" {

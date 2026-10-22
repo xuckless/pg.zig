@@ -28,6 +28,10 @@ pub const Result = struct {
     // Used when the result came directly from the pool.query() helper.
     _release_conn: bool,
 
+    // Values are in the text format (QueryOpts.text_results): read them
+    // raw (row.values), not through the typed getters.
+    _text: bool = false,
+
     pub fn deinit(self: *const Result) void {
         // value.data references the buffer of the reader, this buffer is potentially
         // reused and potentially discarded. There are at least a few very good
@@ -142,7 +146,7 @@ pub const Result = struct {
             const data_end = data_start + @as(usize, @intCast(length));
             value.is_null = false;
             value.data = data[data_start..data_end];
-            try types.check.value(oid, value.data);
+            if (!self._text) try types.check.value(oid, value.data);
             offset = data_end;
         }
         if (offset != data.len) {
