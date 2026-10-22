@@ -156,6 +156,8 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
     var tls_direct = false;
     var application_name: ?[]const u8 = null;
     var tcp_user_timeout: ?u32 = null;
+    var allow: Conn.AuthMethods = .{};
+    var channel_binding: Conn.ChannelBinding = .prefer;
     if (uri.query) |qry| {
         const query_string = try qry.toRawMaybeAlloc(aa);
         var it = std.mem.splitScalar(u8, query_string, '&');
@@ -181,6 +183,10 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
                 }
             } else if (std.mem.eql(u8, key, "application_name")) {
                 application_name = val;
+            } else if (std.mem.eql(u8, key, "require_auth")) {
+                allow = try Conn.AuthMethods.parse(val);
+            } else if (std.mem.eql(u8, key, "channel_binding")) {
+                channel_binding = std.meta.stringToEnum(Conn.ChannelBinding, val) orelse return error.UnsupportedChannelBindingValue;
             } else {
                 return error.UnsupportedConnectionParam;
             }
@@ -220,6 +226,8 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
             .database = if (path.len == 0) null else path,
             .timeout = tcp_user_timeout orelse 10_000,
             .application_name = application_name,
+            .allow = allow,
+            .channel_binding = channel_binding,
         },
         .connect = .{
             .tls = tls_opt,
@@ -307,6 +315,19 @@ test "URI: application_name" {
     var po = try parseOpts(try std.Uri.parse("postgresql:///?application_name=my%20app"), std.testing.allocator);
     defer po.deinit();
     try std.testing.expectEqualStrings("my app", po.opts.auth.application_name.?);
+}
+
+test "URI: require_auth and channel_binding" {
+    var po = try parseOpts(try std.Uri.parse("postgresql:///?require_auth=scram-sha-256&channel_binding=require"), std.testing.allocator);
+    defer po.deinit();
+    try std.testing.expectEqual(Conn.AuthMethods{ .none = false, .password = false, .md5 = false, .scram_sha_256 = true }, po.opts.auth.allow);
+    try std.testing.expectEqual(.require, po.opts.auth.channel_binding);
+
+    try std.testing.expectEqual(Conn.AuthMethods{ .password = false, .md5 = false }, try Conn.AuthMethods.parse("!password,!md5"));
+    try std.testing.expectEqual(Conn.AuthMethods{ .none = true, .password = false, .md5 = true, .scram_sha_256 = true }, try Conn.AuthMethods.parse("none,md5,scram-sha-256,gss"));
+    try std.testing.expectError(error.InvalidRequireAuth, Conn.AuthMethods.parse("!password,md5"));
+    try std.testing.expectError(error.InvalidRequireAuth, Conn.AuthMethods.parse("plaintext"));
+    try std.testing.expectError(error.UnsupportedChannelBindingValue, parseOpts(try std.Uri.parse("postgresql:///?channel_binding=sometimes"), std.testing.allocator));
 }
 
 test "URI: invalid scheme" {

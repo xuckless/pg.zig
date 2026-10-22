@@ -145,6 +145,8 @@ Authentications the request. Prefer creating connections through the pool. Auth 
 * `timeout` : Defaults to `10_000` (milliseconds)
 * `application_name`: Defaults to `null`
 * `params`: Defaults to `null`. An `std.StringHashMap([]const u8)`
+* `allow`: Defaults to all. The ways of logging in the server may ask for (libpq's `require_auth`): `.{ .none, .password, .md5, .scram_sha_256 }`; any other fails with `error.AuthMethodNotAllowed` before the password, or anything derived from it, is sent. Turn off `password` and `md5` unless the server's certificate is verified: anyone between the client and an unverified server can ask for them.
+* `channel_binding`: Defaults to `.prefer`. SCRAM-SHA-256-PLUS (binding the login to the TLS connection, with `tls-server-end-point`) when the server offers it and the TLS module gives the server's certificate (`Connection.peerCertificate`); `.require` refuses any other way of logging in (`error.ChannelBindingRequired`), `.disable` never binds.
 
 ### release(conn: \*Conn) void
 Releases the connection back to the pool. The pool might decide to close the connection and open a new one.
@@ -733,7 +735,7 @@ const uri = try std.Uri.parse("postgresql://user:password@hostname/DBNAME?sslmod
 var pool = try pg.Pool.initUri(io, allocator, uri, .{ .size = 10 });
 ```
 
-URIs take `sslmode` (`disable`, `prefer`, `require`, `verify-ca`, `verify-full`), `sslrootcert` (a path, or `system`, which means `verify-full` against the system's trust store; any other path turns `require` into `verify-ca`, as in libpq), `sslnegotiation` (`postgres` or `direct`) and `application_name`.
+URIs take `sslmode` (`disable`, `prefer`, `require`, `verify-ca`, `verify-full`), `sslrootcert` (a path, or `system`, which means `verify-full` against the system's trust store; any other path turns `require` into `verify-ca`, as in libpq), `sslnegotiation` (`postgres` or `direct`), `application_name`, `require_auth` (libpq's syntax: `scram-sha-256`, `md5,scram-sha-256`, `!password,!md5`) and `channel_binding` (`disable`, `prefer`, `require`).
 
 ## Enabling Column Names by Default
 

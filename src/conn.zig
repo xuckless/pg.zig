@@ -137,6 +137,60 @@ pub const Conn = struct {
         timeout: u32 = 10_000,
         application_name: ?[]const u8 = null,
         startup_parameters: ?std.hash_map.StringHashMap([]const u8) = null,
+        // The ways of logging in the server may ask for (libpq's
+        // require_auth). Any other is refused before a password, or
+        // anything derived from it, goes out: error.AuthMethodNotAllowed.
+        allow: AuthMethods = .{},
+        // Whether SCRAM binds the login to the TLS connection (libpq's
+        // channel_binding), so that a server in the middle can't relay it.
+        channel_binding: ChannelBinding = .prefer,
+    };
+
+    pub const AuthMethods = struct {
+        // the server lets the client in without asking for anything
+        none: bool = true,
+        // the password in clear text
+        password: bool = true,
+        md5: bool = true,
+        scram_sha_256: bool = true,
+
+        // libpq's require_auth: methods separated by commas ("scram-sha-256",
+        // "md5,scram-sha-256"), or all of them negated with "!" ("!password,!md5").
+        // gss, sspi and oauth are known names this client has no use for.
+        pub fn parse(text: []const u8) error{InvalidRequireAuth}!AuthMethods {
+            const negated = std.mem.startsWith(u8, text, "!");
+            var m: AuthMethods = if (negated) .{} else .{ .none = false, .password = false, .md5 = false, .scram_sha_256 = false };
+            var it = std.mem.splitScalar(u8, text, ',');
+            while (it.next()) |item| {
+                if (std.mem.startsWith(u8, item, "!") != negated) return error.InvalidRequireAuth;
+                const name = if (negated) item[1..] else item;
+                const field: *bool = if (std.mem.eql(u8, name, "none"))
+                    &m.none
+                else if (std.mem.eql(u8, name, "password"))
+                    &m.password
+                else if (std.mem.eql(u8, name, "md5"))
+                    &m.md5
+                else if (std.mem.eql(u8, name, "scram-sha-256"))
+                    &m.scram_sha_256
+                else if (std.mem.eql(u8, name, "gss") or std.mem.eql(u8, name, "sspi") or std.mem.eql(u8, name, "oauth"))
+                    continue
+                else
+                    return error.InvalidRequireAuth;
+                field.* = !negated;
+            }
+            return m;
+        }
+    };
+
+    pub const ChannelBinding = enum {
+        // never: plain SCRAM-SHA-256
+        disable,
+        // SCRAM-SHA-256-PLUS when the server offers it over TLS and the TLS
+        // module gives the server's certificate
+        prefer,
+        // only SCRAM-SHA-256-PLUS: any other way of logging in fails with
+        // error.ChannelBindingRequired
+        require,
     };
 
     pub const QueryOpts = struct {
