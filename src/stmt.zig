@@ -349,7 +349,12 @@ pub const Stmt = struct {
 
         // The last part of the bind message is telling PostgreSQL the format we
         // want to receive the result columns in.
-        try lib.types.resultEncoding(self.result_state.oids[0..self.column_count], buf);
+        if (self.opts.text_results) {
+            // one format code, text, for every column
+            try buf.write(&.{ 0, 1, 0, 0 });
+        } else {
+            try lib.types.resultEncoding(self.result_state.oids[0..self.column_count], buf);
+        }
 
         // write the full payload length, which always starts at byte 1 (after
         // the 'B' message type)
@@ -415,6 +420,7 @@ pub const Stmt = struct {
             ._conn = conn,
             ._arena = self.arena,
             ._release_conn = opts.release_conn,
+            ._text = opts.text_results,
             ._oids = state.oids[0..column_count],
             ._values = state.values[0..column_count],
             .column_names = if (opts.column_names) state.names[0..column_count] else &[_][]const u8{},

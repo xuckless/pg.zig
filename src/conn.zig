@@ -217,6 +217,13 @@ pub const Conn = struct {
         // cache (Opts.statement_cache_size). Set to false for one-off SQL so
         // that it doesn't push out statements that are reused.
         statement_cache: bool = true,
+
+        // Ask for every column in PostgreSQL's text format, as psql prints
+        // it (row values hold that text, whatever the type), instead of the
+        // binary format for the types this library decodes. For callers that
+        // hand values on to code that parses PostgreSQL's text output (a
+        // binding's type parsers), and for types with no decoder here.
+        text_results: bool = false,
     };
 
     pub fn openAndAuthUri(io: Io, allocator: Allocator, uri: std.Uri) !Conn {
@@ -979,6 +986,22 @@ test "Conn: values as a slice of tagged unions" {
         try t.expectEqual(2, (try c.exec("insert into simple_table values ($1), ($2)", @as([]const V, &values))).?);
         try t.expectError(error.WrongNumberOfParameters, c.exec("insert into simple_table values ($1)", @as([]const V, &values)));
     }
+}
+
+test "Conn: text results" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+    var result = try c.queryOpts("select 42::int8, true, '\\x0102'::bytea, null::text, array[1,2], 1.50::numeric", .{}, .{ .text_results = true });
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectString("42", row.values[0].data);
+    try t.expectString("t", row.values[1].data);
+    try t.expectString("\\x0102", row.values[2].data);
+    try t.expectEqual(true, row.values[3].is_null);
+    try t.expectString("{1,2}", row.values[4].data);
+    try t.expectString("1.50", row.values[5].data);
+    try t.expectEqual(20, result._oids[0]);
+    try t.expectEqual(null, try result.next());
 }
 
 test "Conn: exec query that returns rows" {
