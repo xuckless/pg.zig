@@ -18,6 +18,7 @@ pub const auth = @import("auth.zig");
 pub const Conn = @import("conn.zig").Conn;
 pub const Stmt = @import("stmt.zig").Stmt;
 pub const StatementCache = @import("statement_cache.zig").StatementCache;
+pub const session = @import("session.zig");
 pub const Pool = @import("pool.zig").Pool;
 pub const Stream = @import("stream.zig").Stream;
 pub const TlsHandshake = @import("stream.zig").TlsHandshake;

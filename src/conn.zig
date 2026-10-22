@@ -39,6 +39,12 @@ pub const Conn = struct {
     // takes it first.
     _reset_pending: bool = false,
 
+    // What the statements run since the last reset may have left in the
+    // session, when _track_session (set by a pool with Pool.Opts.reset =
+    // .auto). See session.zig.
+    _session: lib.session.Effect = .{},
+    _track_session: bool = false,
+
     // The current transation state, this is whatever the last ReadyForQuery
     // message told us
     _state: State,
@@ -423,6 +429,7 @@ pub const Conn = struct {
             if (statement_cache.get(sql)) |entry| {
                 cached = true;
                 auto = entry;
+                self.noteSession(entry.describe.session);
                 stmt = try Stmt.fromDescribe(self, &entry.describe, entry.name(), opts);
                 errdefer stmt.deinit();
 
@@ -444,6 +451,7 @@ pub const Conn = struct {
                 try stmt.prepare(sql, entry.describe.arena.allocator());
                 entry.describe.param_oids = stmt.param_oids;
                 entry.describe.result_state = stmt.result_state;
+                entry.describe.session = stmt.session;
                 statement_cache.add(allocator, entry);
                 added = true;
                 auto = entry;
@@ -454,6 +462,7 @@ pub const Conn = struct {
         if (name) |n| {
             if (self._prepared_statements.getPtr(n)) |describe| {
                 cached = true;
+                self.noteSession(describe.session);
                 stmt = try Stmt.fromDescribe(self, describe, n, opts);
                 errdefer stmt.deinit();
 
@@ -481,6 +490,7 @@ pub const Conn = struct {
                     .arena = describe_arena,
                     .param_oids = stmt.param_oids,
                     .result_state = stmt.result_state,
+                    .session = stmt.session,
                 });
             } else {
                 try stmt.prepare(sql, null);
@@ -581,6 +591,7 @@ pub const Conn = struct {
             };
             const simple_query = proto.Query{ .sql = sql };
             try simple_query.write(buf);
+            self.noteSql(sql);
             // no longer idle, we're now in a query
             lib.metrics.query();
             self._state = .query;
@@ -652,6 +663,7 @@ pub const Conn = struct {
 
         const simple_query = proto.Query{ .sql = sql };
         try simple_query.write(buf);
+        self.noteSql(sql);
         try self.write(buf.string());
         while (true) {
             const msg = self.read() catch |err| {
@@ -673,6 +685,9 @@ pub const Conn = struct {
         const allocator = self._allocator;
         const sql = try std.fmt.allocPrint(allocator, "deallocate {s}", .{cache_name});
         defer allocator.free(sql);
+        // our own statement: nothing the session tracking needs to know
+        const before = self._session;
+        defer self._session = before;
         _ = try self.execOpts(sql, .{}, .{});
     }
 
@@ -713,6 +728,15 @@ pub const Conn = struct {
         }
     }
 
+    // Records what `sql`, about to be sent, may leave in the session.
+    pub fn noteSql(self: *Conn, sql: []const u8) void {
+        if (self._track_session) self._session = self._session.merge(lib.session.scan(sql));
+    }
+
+    fn noteSession(self: *Conn, effect: lib.session.Effect) void {
+        if (self._track_session) self._session = self._session.merge(effect);
+    }
+
     // Should not be called directly
     pub fn peekForError(self: *Conn) !void {
         if (self._reset_pending) try self.finishReset();
@@ -742,7 +766,11 @@ pub const Conn = struct {
                     };
                     return msg;
                 },
-                'S' => {}, // TODO: ParameterStatus,
+                // ParameterStatus: after the startup, the server sends one
+                // when a setting it reports changes
+                'S' => if (self._track_session) {
+                    self._session.settings = true;
+                },
                 'N' => {}, // TODO: NoticeResponse
                 'E' => return self.setErr(msg.data),
                 else => return msg,

@@ -49,6 +49,10 @@ pub const Stmt = struct {
     // by the server
     name: []const u8,
 
+    // What the SQL may leave in the session (session.zig), when the
+    // connection tracks it.
+    session: lib.session.Effect = .{},
+
     pub fn init(conn: *Conn, opts: Conn.QueryOpts) !Stmt {
         const base_allocator = opts.allocator orelse conn._allocator;
         const arena = try base_allocator.create(ArenaAllocator);
@@ -117,6 +121,11 @@ pub const Stmt = struct {
         buf.reset();
 
         const name = self.name;
+
+        if (conn._track_session) {
+            self.session = lib.session.scan(sql);
+            conn._session = conn._session.merge(self.session);
+        }
 
         // Statements the connection's statement cache dropped, which we close
         // ahead of our Parse, in the same round trip.
@@ -433,5 +442,6 @@ pub const Stmt = struct {
         param_oids: []i32,
         arena: ArenaAllocator,
         result_state: Result.State,
+        session: lib.session.Effect = .{},
     };
 };

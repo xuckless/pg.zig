@@ -12,6 +12,7 @@ pub const Mapper = lib.Mapper;
 pub const Binary = lib.Binary;
 
 pub const Listener = @import("listener.zig").Listener;
+pub const session = lib.session;
 
 pub const types = lib.types;
 pub const Cidr = types.Cidr;

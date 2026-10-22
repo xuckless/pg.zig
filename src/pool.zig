@@ -44,19 +44,37 @@ pub const Pool = struct {
         // closed. null for no limit.
         idle_timeout: ?u32 = null,
 
-        // SQL sent when a connection goes back to the pool, so that what one
-        // user of it set for the session (SET, set_config(..., false), SET
-        // ROLE, temporary tables, advisory locks) doesn't carry over to the
-        // next: reset_sql, or SQL of your own. Its answer is read when the
-        // connection is next used, so it adds no round trip. null: none, and
-        // only SET LOCAL (and set_config(..., true)) inside a transaction is
-        // safe to use with the pool. Must outlive the pool.
-        reset: ?[]const u8 = null,
+        // What the pool does to a connection's session when the connection
+        // comes back, so that what one user of it set for the session (SET,
+        // set_config(..., false), SET ROLE, temporary tables, advisory locks,
+        // LISTEN, cursors WITH HOLD) doesn't carry over to the next. A reset
+        // is sent with the release and its answer read when the connection
+        // is next used, so it adds no round trip. A connection is never
+        // handed on inside a transaction: one released in a transaction (or
+        // a failed one) is closed.
+        reset: Reset = .off,
+    };
+
+    pub const Reset = union(enum) {
+        // Nothing: only SET LOCAL (and set_config(..., true)) inside a
+        // transaction is safe to use with the pool.
+        off,
+        // This SQL on every release: reset_sql, or SQL of your own. Must
+        // outlive the pool.
+        always: []const u8,
+        // Reset a connection only when what it ran may have changed the
+        // session, judged from the SQL (session.zig) and from the settings
+        // the server reports changed, with just the statements that undo
+        // it. PREPARE, DEALLOCATE, DISCARD ALL and LOAD close the
+        // connection instead. What a server-side function does is not in
+        // the SQL: DO and CALL get the full reset, a plain function call
+        // none; use .always when functions change session state.
+        auto,
     };
 
     // DISCARD ALL without what it would undo for the statement cache
     // (DEALLOCATE ALL) or what a hot standby refuses (UNLISTEN).
-    pub const reset_sql = "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
+    pub const reset_sql = lib.session.full_reset;
 
     pub const AcquireOpts = struct {
         // When the pool opens a connection for this call and the server
@@ -101,6 +119,7 @@ pub const Pool = struct {
         po.opts.timeout = opts.timeout;
         po.opts.max_lifetime = opts.max_lifetime;
         po.opts.idle_timeout = opts.idle_timeout;
+        po.opts.reset = opts.reset;
         return init(io, allocator, po.opts);
     }
 
@@ -276,13 +295,23 @@ pub const Pool = struct {
             return;
         }
 
-        if (self._opts.reset) |sql| {
-            conn.queueReset(sql) catch {
-                conn.deinit();
-                self._allocator.destroy(conn);
-                self.dropSlot();
-                return;
-            };
+        const reset_ok = switch (self._opts.reset) {
+            .off => true,
+            .always => |sql| if (conn.queueReset(sql)) true else |_| false,
+            .auto => blk: {
+                const effect = conn._session;
+                conn._session = .{};
+                if (effect.close) break :blk false;
+                if (!effect.any()) break :blk true;
+                var buf: [lib.session.max_reset_len]u8 = undefined;
+                break :blk if (conn.queueReset(lib.session.resetSql(effect, &buf))) true else |_| false;
+            },
+        };
+        if (!reset_ok) {
+            conn.deinit();
+            self._allocator.destroy(conn);
+            self.dropSlot();
+            return;
         }
 
         conn._idle_since = now;
@@ -466,6 +495,9 @@ fn newConnection(pool: *Pool, log_failure: bool, connect_error: ?*Pool.ConnectEr
         return err;
     };
     conn._pool = pool;
+    // what the startup sent (ParameterStatus) isn't a change
+    conn._session = .{};
+    conn._track_session = opts.reset == .auto;
     conn._opened_at = Io.Timestamp.now(io, .awake);
     conn._idle_since = conn._opened_at;
     return conn;
@@ -617,7 +649,7 @@ test "Pool: a dirty connection is closed on release and replaced on demand" {
 }
 
 test "Pool: reset clears the session between users" {
-    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .reset = Pool.reset_sql, .connect = .{ .statement_cache_size = 8 } });
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .reset = .{ .always = Pool.reset_sql }, .connect = .{ .statement_cache_size = 8 } });
     defer pool.deinit();
 
     {
@@ -649,8 +681,161 @@ test "Pool: reset clears the session between users" {
     try expectStats(pool, .{ .size = 1, .available = 1, .missing = 0, .in_use = 0 });
 }
 
+test "Pool: .auto undoes each kind of session state, and only that" {
+    {
+        var c = try t.connect(.{});
+        defer c.deinit();
+        _ = c.exec(
+            \\ drop table if exists pgz_reset_serial;
+            \\ create table pgz_reset_serial (id serial primary key);
+            \\ drop function if exists pgz_reset_tz();
+            \\ create function pgz_reset_tz() returns text language sql as $$ select set_config('TimeZone', 'Asia/Tokyo', false) $$;
+            \\ do $$ begin create role pgz_reset_role; exception when duplicate_object then null; end $$;
+        , .{}) catch |err| {
+            if (c.err) |e| std.debug.print("{s}\n", .{e.message});
+            return err;
+        };
+    }
+
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .reset = .auto, .connect = .{ .statement_cache_size = 8 } });
+    defer pool.deinit();
+
+    const Case = struct {
+        // run by one user of the connection
+        set: []const u8,
+        // by the next one: true when nothing of `set` is left
+        check: []const u8,
+        // the connection is closed rather than reset
+        closes: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .set = "set search_path = pg_catalog", .check = "select current_setting('search_path') = '\"$user\", public'" },
+        .{ .set = "select set_config('pgz.tenant', '42', false)", .check = "select coalesce(current_setting('pgz.tenant', true), '') = ''" },
+        .{ .set = "set role pgz_reset_role", .check = "select current_user = 'postgres'" },
+        .{ .set = "set session authorization pgz_reset_role", .check = "select session_user = 'postgres' and current_user = 'postgres'" },
+        .{ .set = "create temp table pgz_reset_tmp (id int)", .check = "select to_regclass('pgz_reset_tmp') is null" },
+        .{ .set = "select pg_advisory_lock(4242)", .check = "select count(*) = 0 from pg_locks where locktype = 'advisory' and pid = pg_backend_pid()" },
+        .{ .set = "listen pgz_reset_chan", .check = "select count(*) = 0 from pg_listening_channels()" },
+        .{ .set = "declare pgz_reset_cur cursor with hold for select 1", .check = "select count(*) = 0 from pg_cursors where name = 'pgz_reset_cur'" },
+        .{ .set = "do $$ begin perform set_config('pgz.tenant', '9', false); end $$", .check = "select coalesce(current_setting('pgz.tenant', true), '') = ''" },
+        // not in the SQL: the server reports the changed setting
+        .{ .set = "select pgz_reset_tz()", .check = "select current_setting('TimeZone') <> 'Asia/Tokyo'" },
+        .{ .set = "prepare pgz_reset_q as select 1", .check = "select count(*) = 0 from pg_prepared_statements where name = 'pgz_reset_q'", .closes = true },
+        .{ .set = "discard all", .check = "select true", .closes = true },
+    };
+
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.set});
+        var pid: u32 = 0;
+        {
+            const c = try pool.acquire();
+            defer pool.release(c);
+            _ = c.exec(case.set, .{}) catch |err| {
+                if (c.err) |e| std.debug.print("{s}\n", .{e.message});
+                return err;
+            };
+            pid = c.backendPid();
+        }
+        {
+            const c = try pool.acquire();
+            defer pool.release(c);
+            var row = (try c.row(case.check, .{})).?;
+            defer row.deinit() catch {};
+            try t.expectEqual(true, try row.get(bool, 0));
+            try t.expectEqual(case.closes, c.backendPid() != pid);
+        }
+    }
+
+    // lastval(): the next user can't see the id the last one got
+    {
+        const c = try pool.acquire();
+        defer pool.release(c);
+        _ = try c.exec("insert into pgz_reset_serial default values", .{});
+    }
+    {
+        const c = try pool.acquire();
+        defer pool.release(c);
+        try t.expectError(error.PG, c.exec("select lastval()", .{}));
+        try t.expectString("55000", c.err.?.code);
+    }
+
+    // a cached statement changes the session on every run, not only the
+    // first, which prepared it
+    for (0..3) |i| {
+        {
+            const c = try pool.acquire();
+            defer pool.release(c);
+            var row = (try c.row("select set_config('pgz.tenant', $1, false)", .{"7"})).?;
+            defer row.deinit() catch {};
+            try t.expectString("7", try row.get([]const u8, 0));
+        }
+        const c = try pool.acquire();
+        defer pool.release(c);
+        var row = (try c.row("select coalesce(current_setting('pgz.tenant', true), '')", .{})).?;
+        defer row.deinit() catch {};
+        try t.expectString("", try row.get([]const u8, 0));
+        if (i > 0) try t.expectEqual(true, c.statementCacheStats().hits > 0);
+    }
+    try expectStats(pool, .{ .size = 1, .available = 1, .missing = 0, .in_use = 0 });
+}
+
+test "Pool: .auto sends no reset after what leaves the session as it was" {
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .reset = .auto, .connect = .{ .statement_cache_size = 8 } });
+    defer pool.deinit();
+
+    const clean = [_][]const u8{
+        "select 1",
+        "select $1::int",
+        "update simple_table set value = 'x' where false",
+        "begin; set local work_mem = '8MB'; select set_config('pgz.tenant', '1', true); commit",
+        "select pg_advisory_xact_lock(4243)",
+    };
+    var pid: u32 = 0;
+    for (clean) |sql| {
+        const c = try pool.acquire();
+        if (pid == 0) pid = c.backendPid();
+        try t.expectEqual(pid, c.backendPid());
+        if (std.mem.indexOfScalar(u8, sql, '$') != null) {
+            var row = (try c.row(sql, .{@as(i32, 1)})).?;
+            row.deinit() catch {};
+        } else {
+            _ = try c.exec(sql, .{});
+        }
+        pool.release(c);
+        // nothing was sent
+        try t.expectEqual(false, c._reset_pending);
+    }
+
+    // and one after what does
+    const c = try pool.acquire();
+    _ = try c.exec("set search_path = pg_catalog", .{});
+    pool.release(c);
+    try t.expectEqual(true, c._reset_pending);
+}
+
+test "Pool: a connection released inside a transaction is closed, never handed on" {
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .reset = .auto });
+    defer pool.deinit();
+
+    for ([_][]const u8{ "begin; set local work_mem = '1234kB'", "begin; set local work_mem = '1234kB'; select 1/0" }) |sql| {
+        const c1 = try pool.acquire();
+        const pid = c1.backendPid();
+        _ = c1.exec(sql, .{}) catch {};
+        pool.release(c1);
+        try expectStats(pool, .{ .size = 1, .available = 0, .missing = 1, .in_use = 0 });
+
+        // a new connection, in no transaction (an aborted one would refuse this)
+        const c2 = try pool.acquire();
+        defer pool.release(c2);
+        try t.expectEqual(true, c2.backendPid() != pid);
+        var row = (try c2.row("select current_setting('work_mem') <> '1234kB'", .{})).?;
+        defer row.deinit() catch {};
+        try t.expectEqual(true, try row.get(bool, 0));
+    }
+}
+
 test "Pool: a connection whose reset fails is closed" {
-    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .reset = "select 1/0" });
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .reset = .{ .always = "select 1/0" } });
     defer pool.deinit();
 
     const c1 = try pool.acquire();
