@@ -155,6 +155,11 @@ fn passwordAuth(password: []const u8, stream: *Stream, buf: *Buffer) !void {
     try stream.writeAll(buf.string());
 }
 
+// The most PBKDF2 iterations a server may ask for (PostgreSQL's default is
+// 4096). Each is an HMAC the client computes before the server has proven
+// anything, so a server asking for billions would hold the client for minutes.
+pub const max_iterations = 1_000_000;
+
 const SASL = struct {
     allocator: Allocator,
     client_first_message: []u8,
@@ -232,6 +237,15 @@ const SASL = struct {
             pos = value_start;
             const sep = std.mem.indexOfScalarPos(u8, owned, pos, ',') orelse owned.len;
             res.iterations = std.fmt.parseInt(u32, owned[pos..sep], 10) catch return error.InvalidIteration;
+            if (res.iterations == 0 or res.iterations > max_iterations) {
+                return error.InvalidIteration;
+            }
+        }
+
+        // RFC 5802: the server's nonce starts with ours, and adds its own.
+        const client_nonce = self.client_first_message[8..];
+        if (res.nonce.len <= client_nonce.len or !std.mem.startsWith(u8, res.nonce, client_nonce)) {
+            return error.InvalidNonce;
         }
 
         self.server_response = res;
@@ -299,8 +313,10 @@ const SASL = struct {
             break :blk encoded_signature;
         };
 
-        // don't tell me about timing leaks unless there's also something in std to deal with it
-        if (std.mem.eql(u8, &computed_signature, data[2..]) == false) {
+        if (data.len != 46 or !std.mem.startsWith(u8, data, "v=")) {
+            return error.InvalidServerSignature;
+        }
+        if (!std.crypto.timing_safe.eql([44]u8, computed_signature, data[2..46].*)) {
             return error.InvalidServerSignature;
         }
     }
@@ -377,8 +393,28 @@ test "SASL: serverResponse" {
     defer t.reset();
     var sasl = try SASL.init(t.io, t.arena.allocator());
 
-    try sasl.serverResponse("r=abc123,s=aaaaxa,i=4096");
-    try t.expectString("abc123", sasl.server_response.?.nonce);
+    const nonce = try std.fmt.allocPrint(t.arena.allocator(), "{s}abc123", .{sasl.client_first_message[8..]});
+    try sasl.serverResponse(try std.fmt.allocPrint(t.arena.allocator(), "r={s},s=aaaaxa,i=4096", .{nonce}));
+    try t.expectString(nonce, sasl.server_response.?.nonce);
     try t.expectString("aaaaxa", sasl.server_response.?.base64_salt);
     try t.expectEqual(4096, sasl.server_response.?.iterations);
+}
+
+test "SASL: serverResponse checks the nonce and the iteration count" {
+    defer t.reset();
+    const a = t.arena.allocator();
+    var sasl = try SASL.init(t.io, a);
+    const client_nonce = sasl.client_first_message[8..];
+
+    // the server's nonce must extend ours
+    try t.expectError(error.InvalidNonce, sasl.serverResponse("r=abc123,s=aaaaxa,i=4096"));
+    try t.expectError(error.InvalidNonce, sasl.serverResponse(try std.fmt.allocPrint(a, "r={s},s=aaaaxa,i=4096", .{client_nonce})));
+    try t.expectError(error.InvalidNonce, sasl.serverResponse(try std.fmt.allocPrint(a, "r=x{s}x,s=aaaaxa,i=4096", .{client_nonce})));
+    // an iteration count that would keep the client hashing for minutes
+    try t.expectError(error.InvalidIteration, sasl.serverResponse(try std.fmt.allocPrint(a, "r={s}x,s=aaaaxa,i=4000000000", .{client_nonce})));
+    try t.expectError(error.InvalidIteration, sasl.serverResponse(try std.fmt.allocPrint(a, "r={s}x,s=aaaaxa,i=0", .{client_nonce})));
+    try t.expectEqual(null, sasl.server_response);
+
+    try sasl.serverResponse(try std.fmt.allocPrint(a, "r={s}x,s=aaaaxa,i={d}", .{ client_nonce, max_iterations }));
+    try t.expectEqual(max_iterations, sasl.server_response.?.iterations);
 }
