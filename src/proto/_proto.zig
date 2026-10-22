@@ -73,7 +73,7 @@ pub const Reader = struct {
 
     pub fn restAsString(self: *Reader) ![]const u8 {
         const r = self.data[self.pos..];
-        if (r[r.len - 1] != 0) {
+        if (r.len == 0 or r[r.len - 1] != 0) {
             return error.NotAString;
         }
         return r[0 .. r.len - 1];

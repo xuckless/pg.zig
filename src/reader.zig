@@ -151,12 +151,12 @@ fn ReaderT(comptime T: type) type {
         // an error, we return it. If it isn't an error, we put it back for the next
         // successful read.
         pub fn peekForError(self: *Self) !?[]const u8 {
-            const message = self.buffered(self.pos, true) orelse try self.read(true);
+            const message = (try self.buffered(self.pos, true)) orelse try self.read(true);
             return if (message.type == 'E') message.data else null;
         }
 
         pub fn next(self: *Self) !Message {
-            return self.buffered(self.pos, false) orelse self.read(false);
+            return (try self.buffered(self.pos, false)) orelse self.read(false);
         }
 
         fn read(self: *Self, error_peek: bool) !Message {
@@ -181,8 +181,7 @@ fn ReaderT(comptime T: type) type {
 
                     // we have enough data to figure the message length
                     if (current_length > 4) {
-                        // + 1 for the type byte
-                        message_length = std.mem.readInt(u32, buf[start + 1 .. start + 5][0..4], .big) + 1;
+                        message_length = try messageLength(buf[start..][0..5]);
 
                         if (message_length > buf.len) {
                             var new_buf: []u8 = undefined;
@@ -226,14 +225,14 @@ fn ReaderT(comptime T: type) type {
                     return error.Closed;
                 }
                 pos += n;
-                if (self.buffered(pos, error_peek)) |msg| {
+                if (try self.buffered(pos, error_peek)) |msg| {
                     return msg;
                 }
             }
         }
 
         // checks and consume if we already have a message buffered
-        fn buffered(self: *Self, pos: usize, error_peek: bool) ?Message {
+        fn buffered(self: *Self, pos: usize, error_peek: bool) !?Message {
             const start = self.start;
             const available = pos - start;
 
@@ -244,15 +243,11 @@ fn ReaderT(comptime T: type) type {
             const buf = self.buf;
 
             const len_end = start + 5;
-            const len = std.mem.readInt(u32, buf[start + 1 .. len_end][0..4], .big);
-
-            // +1 because the first byte, the message type, isn't included in the length
-            if (available < len + 1) {
+            const message_length = try messageLength(buf[start..][0..5]);
+            if (available < message_length) {
                 return null;
             }
-
-            // -4 because the len includes the 4 byte length header itself
-            const end = len_end + len - 4;
+            const end = start + message_length;
 
             const message_type = buf[start];
 
@@ -277,6 +272,35 @@ fn ReaderT(comptime T: type) type {
                 .data = buf[len_end..end],
             };
         }
+    };
+}
+
+// The whole length of the message whose type byte and length field are
+// `header`, type byte included. A length the protocol can't have is an error,
+// before anything is allocated for it: one shorter than the length field
+// itself, one over 2^31-1 (an Int32), and, as libpq does, one over 30000
+// bytes for a type that is never long.
+fn messageLength(header: *const [5]u8) error{InvalidMessageLength}!usize {
+    const len = std.mem.readInt(u32, header[1..5], .big);
+    if (len < 4 or len > std.math.maxInt(i32)) {
+        return error.InvalidMessageLength;
+    }
+    if (len > max_short_message and !canBeLong(header[0])) {
+        return error.InvalidMessageLength;
+    }
+    // + 1 for the type byte
+    return @as(usize, len) + 1;
+}
+
+const max_short_message = 30_000;
+
+// What libpq allows to be long: RowDescription, DataRow, CopyData,
+// FunctionCallResponse, ErrorResponse, NoticeResponse and
+// NotificationResponse.
+fn canBeLong(message_type: u8) bool {
+    return switch (message_type) {
+        'T', 'D', 'd', 'V', 'E', 'N', 'A' => true,
+        else => false,
     };
 }
 
@@ -719,4 +743,30 @@ test "Reader: startFlow with dynamic allocation into deinit " {
     try reader.startFlow(t.arena.allocator(), null);
     const msg1 = try reader.next();
     try t.expectSlice(u8, &.{ 1, 2, 3, 4 }, msg1.data);
+}
+
+test "Reader: lengths a server cannot send" {
+    const R = ReaderT(*t.Stream);
+    var s = t.Stream.init();
+    defer s.deinit();
+
+    const cases = [_][]const u8{
+        // shorter than the length field itself
+        &.{ 1, 0, 0, 0, 0, 9, 9, 9, 9 },
+        &.{ 1, 0, 0, 0, 3, 9, 9, 9, 9 },
+        // more than a 32-bit signed length
+        &.{ 'D', 255, 255, 255, 255, 9, 9, 9 },
+        &.{ 'D', 128, 0, 0, 0, 9, 9, 9 },
+        // a message that is always short, but says it is long
+        &.{ 'Z', 0, 1, 0, 0, 'I' },
+    };
+    for (cases) |bytes| {
+        for ([_]usize{ 64, 6 }) |size| {
+            s.reset();
+            s.add(bytes);
+            var reader = R.init(t.allocator, size, s) catch unreachable;
+            defer reader.deinit();
+            try t.expectError(error.InvalidMessageLength, reader.next());
+        }
+    }
 }

@@ -268,3 +268,62 @@ pub fn scalar(c: *Conn, sql: []const u8) i32 {
     result.drain() catch unreachable;
     return value;
 }
+
+// A fake server for tests of what the client does with a server's answers
+// (or a hostile one's): it accepts one connection and plays `steps`, each
+// waiting for one message from the client and then writing its reply.
+pub const FakeServer = struct {
+    listener: std.Io.net.Server,
+    steps: []const Step,
+    group: std.Io.Group = .init,
+    port: u16 = 0,
+
+    pub const Step = struct {
+        // The message to wait for: 0 for the startup message (no type
+        // byte), else its type ('S' for Sync, 'p' for a password...).
+        wait: u8,
+        reply: []const u8,
+    };
+
+    pub fn start(self: *FakeServer, steps: []const Step) !void {
+        const at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        self.* = .{ .listener = try at.listen(io, .{}), .steps = steps };
+        self.port = self.listener.socket.address.getPort();
+        try self.group.concurrent(io, serve, .{self});
+    }
+
+    pub fn stop(self: *FakeServer) void {
+        self.group.cancel(io);
+        self.listener.deinit(io);
+    }
+
+    fn serve(self: *FakeServer) std.Io.Cancelable!void {
+        const conn = self.listener.accept(io) catch return;
+        defer conn.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var r = conn.reader(io, &rbuf);
+        var w = conn.writer(io, &.{});
+        for (self.steps) |step| {
+            while (true) {
+                var len_type: u8 = 0;
+                if (step.wait != 0) len_type = r.interface.takeByte() catch return;
+                const len = r.interface.takeInt(u32, .big) catch return;
+                if (len < 4) return;
+                r.interface.discardAll(len - 4) catch return;
+                if (len_type == step.wait) break;
+            }
+            w.interface.writeAll(step.reply) catch return;
+        }
+        // until the client goes
+        while (true) _ = r.interface.takeByte() catch return;
+    }
+};
+
+// One backend message: its type, then the length and `body`.
+pub fn message(comptime msg_type: u8, comptime body: []const u8) [body.len + 5]u8 {
+    const len: u32 = body.len + 4;
+    return [_]u8{msg_type} ++ std.mem.toBytes(std.mem.nativeToBig(u32, len)) ++ body[0..body.len].*;
+}
+
+// AuthenticationOk, then ReadyForQuery (idle).
+pub const fake_auth_ok = &(message('R', &.{ 0, 0, 0, 0 }) ++ message('Z', "I"));
