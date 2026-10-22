@@ -34,6 +34,11 @@ pub const Conn = struct {
     _opened_at: Io.Timestamp = .zero,
     _idle_since: Io.Timestamp = .zero,
 
+    // A session reset (queueReset) was sent and its answer not read yet. It
+    // comes before the answer to anything sent after it, so the next read
+    // takes it first.
+    _reset_pending: bool = false,
+
     // The current transation state, this is whatever the last ReadyForQuery
     // message told us
     _state: State,
@@ -658,8 +663,46 @@ pub const Conn = struct {
         _ = try self.execOpts(sql, .{}, .{});
     }
 
+    // Sends `sql` (a simple query, normally Pool.Opts.reset_sql) without
+    // waiting for its answer: the connection's next use reads it first, so
+    // resetting the session costs no round trip of its own. If the reset
+    // fails, that next use fails with error.SessionResetFailed and the
+    // connection is closed when it's released.
+    pub fn queueReset(self: *Conn, sql: []const u8) !void {
+        // nothing ran since the last one
+        if (self._reset_pending) return;
+        var buf = &self._buf;
+        buf.reset();
+        const reset = proto.Query{ .sql = sql };
+        try reset.write(buf);
+        try self.write(buf.string());
+        self._reset_pending = true;
+    }
+
+    fn finishReset(self: *Conn) !void {
+        self._reset_pending = false;
+        var failed = false;
+        while (true) {
+            const msg = self._reader.next() catch |err| {
+                self._state = .fail;
+                return err;
+            };
+            switch (msg.type) {
+                'Z' => break,
+                'E' => failed = true,
+                // CommandComplete, a row of the SELECT, ParameterStatus...
+                else => {},
+            }
+        }
+        if (failed) {
+            self._state = .fail;
+            return error.SessionResetFailed;
+        }
+    }
+
     // Should not be called directly
     pub fn peekForError(self: *Conn) !void {
+        if (self._reset_pending) try self.finishReset();
         const data = (try self._reader.peekForError()) orelse return;
         try self.readyForQuery();
         return self.setErr(data);
@@ -667,6 +710,7 @@ pub const Conn = struct {
 
     // Should not be called directly
     pub fn read(self: *Conn) !lib.Message {
+        if (self._reset_pending) try self.finishReset();
         var reader = &self._reader;
         while (true) {
             const msg = reader.next() catch |err| {
