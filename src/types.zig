@@ -1417,6 +1417,32 @@ pub fn bindValue(comptime T: type, oid: i32, value: anytype, buf: *buffer.Buffer
             return buf.write(&.{ 255, 255, 255, 255 });
         },
         .@"enum", .enum_literal => return String.encode(@tagName(value), buf, format_pos),
+        .@"union" => |u| {
+            // A tagged union is the value it holds, for parameters whose type
+            // is known only at run time (a slice of them, given to query or
+            // exec). A void payload is NULL. A number or bool the parameter's
+            // type does not take in binary goes as text, which PostgreSQL
+            // parses into that type (an integer for a numeric or text
+            // parameter, say), as text-only drivers do.
+            if (u.tag_type == null) compileHaltBindError(T);
+            switch (value) {
+                inline else => |v| {
+                    const V = @TypeOf(v);
+                    if (V == void) return buf.write(&.{ 255, 255, 255, 255 });
+                    return bindValue(V, oid, v, buf, format_pos) catch |err| {
+                        switch (@typeInfo(V)) {
+                            .int, .float, .bool => if (@as(anyerror, err) == error.BindWrongType) {
+                                var text: [64]u8 = undefined;
+                                const s = std.fmt.bufPrint(&text, "{}", .{v}) catch unreachable;
+                                return String.encode(s, buf, format_pos);
+                            },
+                            else => {},
+                        }
+                        return err;
+                    };
+                },
+            }
+        },
         else => compileHaltBindError(T),
     }
 }

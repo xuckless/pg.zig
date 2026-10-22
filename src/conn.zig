@@ -486,8 +486,14 @@ pub const Conn = struct {
                 return error.WrongNumberOfParameters;
             }
 
-            inline for (values) |value| {
-                try stmt.bind(value);
+            if (comptime @typeInfo(@TypeOf(values)) == .pointer) {
+                // A slice: values whose number is known at run time (each
+                // a tagged union, say; see `types.bindValue`).
+                for (values) |value| try stmt.bind(value);
+            } else {
+                inline for (values) |value| {
+                    try stmt.bind(value);
+                }
             }
         }
 
@@ -948,6 +954,30 @@ test "Conn: exec with values rowsAffected" {
     {
         const n = try c.exec("insert into simple_table values ($1), ($2)", .{ "exec_insert_args_a", "exec_insert_args_b" });
         try t.expectEqual(2, n.?);
+    }
+}
+
+test "Conn: values as a slice of tagged unions" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+    const V = union(enum) { null, int: i64, float: f64, text: []const u8, bool: bool, binary: lib.Binary };
+    {
+        // numbers into numeric and text parameters go as text
+        const values = [_]V{ .{ .int = 7 }, .{ .float = 2.5 }, .{ .int = 3 }, .{ .text = "x" }, .null, .{ .bool = true }, .{ .binary = .{ .data = "\x00\x01" } } };
+        var row = (try c.row("select $1::int8 + 1, $2::numeric::text, $3::text, $4::text, $5::int4 is null, $6::bool, $7::bytea", @as([]const V, &values))).?;
+        defer row.deinit() catch {};
+        try t.expectEqual(8, try row.get(i64, 0));
+        try t.expectString("2.5", try row.get([]const u8, 1));
+        try t.expectString("3", try row.get([]const u8, 2));
+        try t.expectString("x", try row.get([]const u8, 3));
+        try t.expectEqual(true, try row.get(bool, 4));
+        try t.expectEqual(true, try row.get(bool, 5));
+        try t.expectString("\x00\x01", try row.get([]const u8, 6));
+    }
+    {
+        const values = [_]V{ .{ .text = "dyn_a" }, .{ .text = "dyn_b" } };
+        try t.expectEqual(2, (try c.exec("insert into simple_table values ($1), ($2)", @as([]const V, &values))).?);
+        try t.expectError(error.WrongNumberOfParameters, c.exec("insert into simple_table values ($1)", @as([]const V, &values)));
     }
 }
 
