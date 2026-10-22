@@ -20,21 +20,16 @@ pub fn parse(data: []const u8) !CommandComplete {
 // "insert" is a bit more complicated, but the rows inserted is the last number
 // so this works for it too.
 pub fn rowsAffected(self: CommandComplete) ?i64 {
+    // the digits at the end of the tag, if any
     const tag = self.tag;
-    const end = tag.len - 1;
-    var i: usize = end;
-    while (i >= 0) : (i -= 1) {
-        const b = tag[i];
-        if (b < '0' or b > '9') {
-            break;
-        }
+    var i: usize = tag.len;
+    while (i > 0 and std.ascii.isDigit(tag[i - 1])) {
+        i -= 1;
     }
-
-    if (i == end) {
+    if (i == tag.len) {
         return null;
     }
-
-    return std.fmt.parseInt(i64, tag[(i + 1)..], 10) catch unreachable;
+    return std.fmt.parseInt(i64, tag[i..], 10) catch null;
 }
 
 const t = proto.testing;
@@ -60,6 +55,13 @@ test "CommandComplete: parse" {
 }
 
 test "CommandComplete: rowsAffected" {
+    {
+        // what a server would not send
+        try t.expectEqual(null, (CommandComplete{ .tag = "" }).rowsAffected());
+        try t.expectEqual(12, (CommandComplete{ .tag = "12" }).rowsAffected());
+        try t.expectEqual(null, (CommandComplete{ .tag = "UPDATE 99999999999999999999999" }).rowsAffected());
+    }
+
     {
         const c = CommandComplete{ .tag = "DROP ROLE" };
         try t.expectEqual(null, c.rowsAffected());

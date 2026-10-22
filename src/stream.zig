@@ -45,6 +45,8 @@ pub const TlsMode = enum {
 //   pub const Config = struct { ... } // Conn.Opts.tls_config; `.{}` must be valid
 //   pub const input_buffer_len: usize // buffer of the socket reader it's given
 //   pub const output_buffer_len: usize // buffer of the socket writer it's given
+//   // on Connection: the server's certificate (DER), for SCRAM channel binding
+//   pub fn peerCertificate(self: *const Connection) ?[]const u8
 //
 // `client` runs the handshake over `input` and `output`, which read and write
 // the socket through Io and report socket errors (including error.Timeout and
@@ -208,6 +210,18 @@ pub const Stream = struct {
     pub fn isTls(self: Stream) bool {
         if (comptime has_tls == false) return false;
         return self.inner.tls != null;
+    }
+
+    // The tls-server-end-point channel binding data of the connection (see
+    // auth.serverEndPoint), when it uses TLS and the TLS module gives the
+    // server's certificate: a Connection declaring
+    //   pub fn peerCertificate(self: *const Connection) ?[]const u8 // DER
+    pub fn tlsServerEndPoint(self: Stream, out: *[64]u8) ?[]const u8 {
+        if (comptime has_tls == false) return null;
+        if (comptime !@hasDecl(tls.Connection, "peerCertificate")) return null;
+        const state = if (self.inner.tls) |*state| state else return null;
+        const der = state.conn.peerCertificate() orelse return null;
+        return lib.auth.serverEndPoint(der, out);
     }
 
     pub fn close(self: Stream) void {

@@ -30,6 +30,8 @@ pub const binary_encoding = [2]u8{ 0, 1 };
 
 pub const Cidr = @import("types/cidr.zig").Cidr;
 pub const Numeric = @import("types/numeric.zig").Numeric;
+// Checks a value from the server before any decoder reads it.
+pub const check = @import("types/check.zig");
 
 pub const Char = struct {
     // A blank-padded char
@@ -47,11 +49,12 @@ pub const Char = struct {
             if (comptime fail_mode == .unsafe) unreachable;
             return err;
         };
-        return data[0];
+        return decodeKnown(data);
     }
 
     pub fn decodeKnown(data: []const u8) u8 {
-        return data[0];
+        // An empty bpchar is all trailing spaces.
+        return if (data.len == 0) ' ' else data[0];
     }
 };
 
@@ -1613,6 +1616,10 @@ fn compileHaltBindError(comptime T: type) noreturn {
 }
 
 const t = lib.testing;
+test {
+    _ = check;
+}
+
 test "UUID: toString" {
     try t.expectError(error.InvalidUUID, UUID.toString(&.{ 73, 190, 142, 9, 170, 250, 176, 16, 73, 21 }));
 

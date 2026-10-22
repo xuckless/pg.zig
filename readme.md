@@ -71,6 +71,7 @@ Initializes a connection pool. Pool options are:
 * `connect_on_init_count`:  - The # of connections in the pool to eagerly connect during `init`. Defaults to `null` which will initiliaze all connections (`size`). The remaining (`size - connect_on_init_count`) connections are opened on demand by `acquire()`. This can be set to `0`, to prevent `init` from failing except in extreme cases (i.e. OOM), but that will hide any configuration/connection issue until the first query is executed.
 * `max_lifetime` - Milliseconds, from when it was opened, after which a connection is closed instead of being reused: when it's released, or found idle by `acquire`. Useful behind a load balancer or a failover, so that connections don't stick to one server forever. Defaults to `null` (no limit).
 * `idle_timeout` - Milliseconds a connection may sit idle in the pool before it's closed. The pool has no background task: expired connections are closed (a few at a time) when the pool is next used, by `acquire` or `release`. Defaults to `null` (no limit).
+* `reset` - SQL sent when a connection goes back to the pool, so that what one user set for the session (`SET`, `set_config(..., false)`, `SET ROLE`, temporary tables, advisory locks) doesn't carry over to the next: `pg.Pool.reset_sql` (`DISCARD ALL` without `DEALLOCATE ALL`, so prepared statements stay) or SQL of your own. Its answer is read when the connection is next used, so it costs no round trip. Defaults to `null`: nothing is reset, and only `SET LOCAL` (or `set_config(..., true)`) inside a transaction is safe with a pool.
 
 When `acquire()` opens a connection and the server refuses it (a wrong password, a database that doesn't exist), it returns `error.PG`, and the connection that had the server's error is gone. `acquireOpts` can keep that error:
 
@@ -145,6 +146,8 @@ Authentications the request. Prefer creating connections through the pool. Auth 
 * `timeout` : Defaults to `10_000` (milliseconds)
 * `application_name`: Defaults to `null`
 * `params`: Defaults to `null`. An `std.StringHashMap([]const u8)`
+* `allow`: Defaults to all. The ways of logging in the server may ask for (libpq's `require_auth`): `.{ .none, .password, .md5, .scram_sha_256 }`; any other fails with `error.AuthMethodNotAllowed` before the password, or anything derived from it, is sent. Turn off `password` and `md5` unless the server's certificate is verified: anyone between the client and an unverified server can ask for them.
+* `channel_binding`: Defaults to `.prefer`. SCRAM-SHA-256-PLUS (binding the login to the TLS connection, with `tls-server-end-point`) when the server offers it and the TLS module gives the server's certificate (`Connection.peerCertificate`); `.require` refuses any other way of logging in (`error.ChannelBindingRequired`), `.disable` never binds.
 
 ### release(conn: \*Conn) void
 Releases the connection back to the pool. The pool might decide to close the connection and open a new one.
@@ -733,7 +736,7 @@ const uri = try std.Uri.parse("postgresql://user:password@hostname/DBNAME?sslmod
 var pool = try pg.Pool.initUri(io, allocator, uri, .{ .size = 10 });
 ```
 
-URIs take `sslmode` (`disable`, `prefer`, `require`, `verify-ca`, `verify-full`), `sslrootcert` (a path, or `system`, which means `verify-full` against the system's trust store; any other path turns `require` into `verify-ca`, as in libpq), `sslnegotiation` (`postgres` or `direct`) and `application_name`.
+URIs take `sslmode` (`disable`, `prefer`, `require`, `verify-ca`, `verify-full`), `sslrootcert` (a path, or `system`, which means `verify-full` against the system's trust store; any other path turns `require` into `verify-ca`, as in libpq), `sslnegotiation` (`postgres` or `direct`), `application_name`, `require_auth` (libpq's syntax: `scram-sha-256`, `md5,scram-sha-256`, `!password,!md5`) and `channel_binding` (`disable`, `prefer`, `require`).
 
 ## Enabling Column Names by Default
 

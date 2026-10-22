@@ -94,31 +94,11 @@ pub const Result = struct {
         const msg = try self._conn.read();
         switch (msg.type) {
             'D' => {
-                const data = msg.data;
-                // Since our Row API gets data by column #, we need translate the column
-                // # to a slice within msg.data. We could do this on the fly within Row,
-                // but creating this mapping up front simplifies things and, in normal
-                // cases, performs best. "Normal case" here assumes that the client app
-                // is going to fetch most/all columns.
-
-                // first column starts at position 2
-                var offset: usize = 2;
+                self.fillValues(msg.data) catch |err| {
+                    self._conn._state = .fail;
+                    return err;
+                };
                 const values = self._values;
-                for (values) |*value| {
-                    const data_start = offset + 4;
-                    const length = std.mem.readInt(i32, data[offset..data_start][0..4], .big);
-                    if (length == -1) {
-                        value.is_null = true;
-                        value.data = &[_]u8{};
-                        offset = data_start;
-                    } else {
-                        const data_end = data_start + @as(usize, @intCast(length));
-                        value.is_null = false;
-                        value.data = data[data_start..data_end];
-                        offset = data_end;
-                    }
-                }
-
                 return .{
                     .values = values,
                     .oids = self._oids,
@@ -130,6 +110,43 @@ pub const Result = struct {
                 return null;
             },
             else => return error.UnexpectedDBMessage,
+        }
+    }
+
+    // Since our Row API gets data by column #, we translate the column # to a
+    // slice within the DataRow's data up front. Everything the server sent is
+    // checked first: the column count against the RowDescription's, each
+    // length against what is left, and each value against its type.
+    fn fillValues(self: *Result, data: []const u8) error{InvalidDataRow}!void {
+        const values = self._values;
+        if (data.len < 2 or std.mem.readInt(u16, data[0..2], .big) != values.len) {
+            return error.InvalidDataRow;
+        }
+
+        var offset: usize = 2;
+        for (values, self._oids) |*value, oid| {
+            if (data.len - offset < 4) {
+                return error.InvalidDataRow;
+            }
+            const data_start = offset + 4;
+            const length = std.mem.readInt(i32, data[offset..data_start][0..4], .big);
+            if (length == -1) {
+                value.is_null = true;
+                value.data = &[_]u8{};
+                offset = data_start;
+                continue;
+            }
+            if (length < 0 or length > data.len - data_start) {
+                return error.InvalidDataRow;
+            }
+            const data_end = data_start + @as(usize, @intCast(length));
+            value.is_null = false;
+            value.data = data[data_start..data_end];
+            try types.check.value(oid, value.data);
+            offset = data_end;
+        }
+        if (offset != data.len) {
+            return error.InvalidDataRow;
         }
     }
 
@@ -326,10 +343,14 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
 
         pub fn record(self: *const Self, col: usize) RecordT(fail_mode) {
             const data = self.values[col].data;
+            if (data.len < 4) {
+                // not a record; next() finds nothing to read
+                return .{ .data = &.{}, .number_of_columns = 0 };
+            }
             const number_of_columns = std.mem.readInt(i32, data[0..4], .big);
             return .{
                 .data = data[4..],
-                .number_of_columns = @intCast(number_of_columns),
+                .number_of_columns = std.math.cast(usize, number_of_columns) orelse 0,
             };
         }
 
@@ -879,8 +900,9 @@ pub fn RecordT(comptime fail_mode: lib.FailMode) type {
         pub fn next(self: *Self, comptime T: type) if (fail_mode == .safe) lib.TypeError!T else T {
             var data = self.data;
 
-            // at least 4 bytes for the type and 4 bytes for the lenght
-            lib.assert(data.len >= 8);
+            // at least 4 bytes for the type and 4 bytes for the length; the
+            // field is checked like a column's value before it's decoded
+            if (data.len < 8) return invalid();
 
             const oid = std.mem.readInt(i32, data[0..4], .big);
 
@@ -895,14 +917,21 @@ pub fn RecordT(comptime fail_mode: lib.FailMode) type {
                 else => T,
             };
 
+            if (len < 0 or len > data.len - 4) return invalid();
             // end of the data for this "column"
             const end = @as(usize, @intCast(len)) + 4;
+            types.check.value(oid, data[4..end]) catch return invalid();
 
             // the rest of the data
             self.data = data[end..];
 
             // start at 4 to skip the length which we already read
             return types.decodeScalar(fail_mode, TT, data[4..end], oid);
+        }
+
+        fn invalid() if (fail_mode == .safe) lib.TypeError else noreturn {
+            if (comptime fail_mode == .safe) return error.InvalidType;
+            @panic("invalid record field");
         }
     };
 }
@@ -2173,4 +2202,103 @@ fn expectResultMapper(conn: *Conn, sql: []const u8, expected: anytype, opts: Res
     }
 
     try t.expectEqual(null, mapper.next());
+}
+
+// A query against a fake server whose RowDescription says one column of
+// type `oid`, and whose DataRow is `data_row`; what the first row gives.
+fn fakeRow(comptime oid: u32, comptime data_row: []const u8, comptime T: type) !T {
+    const row_description = comptime [_]u8{ 0, 1 } ++ "a\x00".* ++ .{ 0, 0, 0, 0, 0, 0 } ++ std.mem.toBytes(std.mem.nativeToBig(u32, oid)) ++ .{ 0, 4, 255, 255, 255, 255, 0, 1 };
+    var server: t.FakeServer = undefined;
+    try server.start(&.{
+        .{ .wait = 0, .reply = t.fake_auth_ok },
+        .{ .wait = 'S', .reply = comptime &(t.message('1', "") ++ t.message('t', &.{ 0, 0 }) ++ t.message('T', &row_description) ++ t.message('Z', "I")) },
+        .{ .wait = 'S', .reply = comptime &(t.message('2', "") ++ t.message('D', data_row) ++ t.message('C', "SELECT 1\x00") ++ t.message('Z', "I")) },
+    });
+    defer server.stop();
+
+    var c = try Conn.open(t.io, t.allocator, .{ .host = "127.0.0.1", .port = server.port, .tls = .off });
+    defer c.deinit();
+    try c.auth(.{ .username = "u", .database = "d" });
+    var result = try c.query("select a", .{});
+    defer result.deinit();
+    const row = (try result.next()) orelse return error.NoRow;
+    return row.get(T, 0);
+}
+
+test "Result: a DataRow that does not match its RowDescription" {
+    const int4 = types.Int32.oid.decimal;
+    // a good one
+    try t.expectEqual(7, try fakeRow(int4, &.{ 0, 1, 0, 0, 0, 4, 0, 0, 0, 7 }, i32));
+    // a length beyond the message
+    try t.expectError(error.InvalidDataRow, fakeRow(int4, &.{ 0, 1, 0, 0, 0, 100, 0, 0, 0, 7 }, i32));
+    // a negative length other than -1 (NULL)
+    try t.expectError(error.InvalidDataRow, fakeRow(int4, &.{ 0, 1, 255, 255, 255, 250, 0, 0, 0, 7 }, i32));
+    // fewer columns than described
+    try t.expectError(error.InvalidDataRow, fakeRow(int4, &.{ 0, 0 }, i32));
+    // more columns than described
+    try t.expectError(error.InvalidDataRow, fakeRow(int4, &.{ 0, 2, 0, 0, 0, 4, 0, 0, 0, 7, 255, 255, 255, 255 }, i32));
+    // bytes left over after the columns
+    try t.expectError(error.InvalidDataRow, fakeRow(int4, &.{ 0, 1, 0, 0, 0, 4, 0, 0, 0, 7, 1 }, i32));
+    // no column count at all
+    try t.expectError(error.InvalidDataRow, fakeRow(int4, &.{0}, i32));
+    // an int4 that is not 4 bytes
+    try t.expectError(error.InvalidDataRow, fakeRow(int4, &.{ 0, 1, 0, 0, 0, 2, 0, 7 }, i32));
+}
+
+// What passes types.check must be safe for the decoders: mutated arrays,
+// numerics and records are either refused or decoded without a fault.
+test "Result: checked values decode, mutated or not" {
+    var r = t.getRandom();
+    const random = r.random();
+    const Case = struct { oid: i32, bytes: []const u8 };
+    const cases = [_]Case{
+        // int4[] {1, NULL, 3}
+        .{ .oid = 1007, .bytes = &.{ 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 23, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 1, 255, 255, 255, 255, 0, 0, 0, 4, 0, 0, 0, 3 } },
+        // numeric 1234.5678
+        .{ .oid = 1700, .bytes = &.{ 0, 2, 0, 0, 0, 0, 0, 4, 4, 210, 22, 46 } },
+        // numeric[] {12.5}
+        .{ .oid = 1231, .bytes = &.{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 6, 164, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 12, 0, 2, 0, 0, 0, 0, 0, 1, 0, 12, 19, 136 } },
+        // (int4 5, text 'ab')
+        .{ .oid = 2249, .bytes = &.{ 0, 0, 0, 2, 0, 0, 0, 23, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 25, 0, 0, 0, 2, 'a', 'b' } },
+    };
+    var buf: [64]u8 = undefined;
+    for (cases) |case| {
+        try types.check.value(case.oid, case.bytes);
+        for (0..3000) |_| {
+            const data = buf[0..case.bytes.len];
+            @memcpy(data, case.bytes);
+            for (0..random.uintAtMost(usize, 3) + 1) |_| {
+                data[random.uintLessThan(usize, data.len)] = random.int(u8);
+            }
+            const len = random.uintAtMost(usize, data.len);
+            const value = data[0..len];
+            types.check.value(case.oid, value) catch continue;
+            const v: Result.State.Value = .{ .is_null = false, .data = value };
+            switch (case.oid) {
+                1007 => {
+                    var it = Iterator(?i32).fromPgzRow(v, case.oid) catch continue;
+                    const items = try it.alloc(t.allocator);
+                    t.allocator.free(items);
+                },
+                1700 => {
+                    const n = types.Numeric.decodeKnown(value);
+                    const text = try t.allocator.alloc(u8, n.estimatedStringLen());
+                    defer t.allocator.free(text);
+                    _ = try n.toString(text);
+                    _ = n.toFloat();
+                },
+                1231 => {
+                    var it = Iterator(?f64).fromPgzRow(v, case.oid) catch continue;
+                    const items = try it.alloc(t.allocator);
+                    t.allocator.free(items);
+                },
+                2249 => {
+                    var rec = Record{ .data = value[4..], .number_of_columns = std.mem.readInt(u32, value[0..4], .big) };
+                    _ = rec.next(i32) catch continue;
+                    _ = rec.next([]const u8) catch continue;
+                },
+                else => unreachable,
+            }
+        }
+    }
 }

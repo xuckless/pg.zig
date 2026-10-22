@@ -104,6 +104,9 @@ pub const Listener = struct {
         }
     }
 
+    // The longest channel name: PostgreSQL's NAMEDATALEN - 1.
+    pub const max_channel_len = 63;
+
     const ListenOpts = struct {
         timeout: u32 = 0,
     };
@@ -111,15 +114,18 @@ pub const Listener = struct {
         // LISTEN doesn't support parameterized queries. It has to be a simple query.
         // We don't use proto.Query because we want to quote the identifier.
 
+        // PostgreSQL cuts a longer identifier to its first 63 bytes
+        // (NAMEDATALEN - 1), so two longer names could be one channel.
+        if (channel.len > max_channel_len) {
+            return error.ChannelNameTooLong;
+        }
+
         const buf = &self._buf;
         buf.reset();
 
-        // "LISTEN " = 7
-        // "IDENTIFIER" = 128
-        // max identifier size is 63, but if we need to quote every character, that's
-        // 126. + 2 for the opening and closing quote
-        // + 1 for null terminator
-        try buf.ensureTotalCapacity(136);
+        // 'Q' + length (4) + "LISTEN " (7) + the quoted identifier (2 quotes,
+        // and every character doubled at most) + null terminator
+        try buf.ensureTotalCapacity(1 + 4 + 7 + 2 + 2 * channel.len + 1);
         buf.writeByteAssumeCapacity('Q');
 
         var len_view = try buf.skip(4);
@@ -253,6 +259,16 @@ test "Listener: timeout" {
     try t.expectEqual(null, l.next());
     try t.expectEqual(true, start.untilNow(t.io).raw.toMilliseconds() < 1500);
     try t.expectEqual(error.Timeout, l.err.?.err);
+}
+
+test "Listener: channel names up to PostgreSQL's limit" {
+    var l = try Listener.open(t.io, t.allocator, .{ .host = "127.0.0.1" });
+    defer l.deinit();
+    try l.auth(t.authOpts(.{}));
+    try l.listen(&@as([63]u8, @splat('c')), .{});
+    try l.listen(&@as([63]u8, @splat('"')), .{});
+    try t.expectError(error.ChannelNameTooLong, l.listen(&@as([64]u8, @splat('c')), .{}));
+    try t.expectError(error.ChannelNameTooLong, l.listen(&@as([3000]u8, @splat('"')), .{}));
 }
 
 fn testListener(l: *Listener) !void {

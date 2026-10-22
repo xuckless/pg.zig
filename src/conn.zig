@@ -34,6 +34,11 @@ pub const Conn = struct {
     _opened_at: Io.Timestamp = .zero,
     _idle_since: Io.Timestamp = .zero,
 
+    // A session reset (queueReset) was sent and its answer not read yet. It
+    // comes before the answer to anything sent after it, so the next read
+    // takes it first.
+    _reset_pending: bool = false,
+
     // The current transation state, this is whatever the last ReadyForQuery
     // message told us
     _state: State,
@@ -137,6 +142,60 @@ pub const Conn = struct {
         timeout: u32 = 10_000,
         application_name: ?[]const u8 = null,
         startup_parameters: ?std.hash_map.StringHashMap([]const u8) = null,
+        // The ways of logging in the server may ask for (libpq's
+        // require_auth). Any other is refused before a password, or
+        // anything derived from it, goes out: error.AuthMethodNotAllowed.
+        allow: AuthMethods = .{},
+        // Whether SCRAM binds the login to the TLS connection (libpq's
+        // channel_binding), so that a server in the middle can't relay it.
+        channel_binding: ChannelBinding = .prefer,
+    };
+
+    pub const AuthMethods = struct {
+        // the server lets the client in without asking for anything
+        none: bool = true,
+        // the password in clear text
+        password: bool = true,
+        md5: bool = true,
+        scram_sha_256: bool = true,
+
+        // libpq's require_auth: methods separated by commas ("scram-sha-256",
+        // "md5,scram-sha-256"), or all of them negated with "!" ("!password,!md5").
+        // gss, sspi and oauth are known names this client has no use for.
+        pub fn parse(text: []const u8) error{InvalidRequireAuth}!AuthMethods {
+            const negated = std.mem.startsWith(u8, text, "!");
+            var m: AuthMethods = if (negated) .{} else .{ .none = false, .password = false, .md5 = false, .scram_sha_256 = false };
+            var it = std.mem.splitScalar(u8, text, ',');
+            while (it.next()) |item| {
+                if (std.mem.startsWith(u8, item, "!") != negated) return error.InvalidRequireAuth;
+                const name = if (negated) item[1..] else item;
+                const field: *bool = if (std.mem.eql(u8, name, "none"))
+                    &m.none
+                else if (std.mem.eql(u8, name, "password"))
+                    &m.password
+                else if (std.mem.eql(u8, name, "md5"))
+                    &m.md5
+                else if (std.mem.eql(u8, name, "scram-sha-256"))
+                    &m.scram_sha_256
+                else if (std.mem.eql(u8, name, "gss") or std.mem.eql(u8, name, "sspi") or std.mem.eql(u8, name, "oauth"))
+                    continue
+                else
+                    return error.InvalidRequireAuth;
+                field.* = !negated;
+            }
+            return m;
+        }
+    };
+
+    pub const ChannelBinding = enum {
+        // never: plain SCRAM-SHA-256
+        disable,
+        // SCRAM-SHA-256-PLUS when the server offers it over TLS and the TLS
+        // module gives the server's certificate
+        prefer,
+        // only SCRAM-SHA-256-PLUS: any other way of logging in fails with
+        // error.ChannelBindingRequired
+        require,
     };
 
     pub const QueryOpts = struct {
@@ -604,8 +663,46 @@ pub const Conn = struct {
         _ = try self.execOpts(sql, .{}, .{});
     }
 
+    // Sends `sql` (a simple query, normally Pool.Opts.reset_sql) without
+    // waiting for its answer: the connection's next use reads it first, so
+    // resetting the session costs no round trip of its own. If the reset
+    // fails, that next use fails with error.SessionResetFailed and the
+    // connection is closed when it's released.
+    pub fn queueReset(self: *Conn, sql: []const u8) !void {
+        // nothing ran since the last one
+        if (self._reset_pending) return;
+        var buf = &self._buf;
+        buf.reset();
+        const reset = proto.Query{ .sql = sql };
+        try reset.write(buf);
+        try self.write(buf.string());
+        self._reset_pending = true;
+    }
+
+    fn finishReset(self: *Conn) !void {
+        self._reset_pending = false;
+        var failed = false;
+        while (true) {
+            const msg = self._reader.next() catch |err| {
+                self._state = .fail;
+                return err;
+            };
+            switch (msg.type) {
+                'Z' => break,
+                'E' => failed = true,
+                // CommandComplete, a row of the SELECT, ParameterStatus...
+                else => {},
+            }
+        }
+        if (failed) {
+            self._state = .fail;
+            return error.SessionResetFailed;
+        }
+    }
+
     // Should not be called directly
     pub fn peekForError(self: *Conn) !void {
+        if (self._reset_pending) try self.finishReset();
         const data = (try self._reader.peekForError()) orelse return;
         try self.readyForQuery();
         return self.setErr(data);
@@ -613,6 +710,7 @@ pub const Conn = struct {
 
     // Should not be called directly
     pub fn read(self: *Conn) !lib.Message {
+        if (self._reset_pending) try self.finishReset();
         var reader = &self._reader;
         while (true) {
             const msg = reader.next() catch |err| {

@@ -43,7 +43,20 @@ pub const Pool = struct {
         // Milliseconds a connection may sit idle in the pool before it's
         // closed. null for no limit.
         idle_timeout: ?u32 = null,
+
+        // SQL sent when a connection goes back to the pool, so that what one
+        // user of it set for the session (SET, set_config(..., false), SET
+        // ROLE, temporary tables, advisory locks) doesn't carry over to the
+        // next: reset_sql, or SQL of your own. Its answer is read when the
+        // connection is next used, so it adds no round trip. null: none, and
+        // only SET LOCAL (and set_config(..., true)) inside a transaction is
+        // safe to use with the pool. Must outlive the pool.
+        reset: ?[]const u8 = null,
     };
+
+    // DISCARD ALL without what it would undo for the statement cache
+    // (DEALLOCATE ALL) or what a hot standby refuses (UNLISTEN).
+    pub const reset_sql = "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
 
     pub const AcquireOpts = struct {
         // When the pool opens a connection for this call and the server
@@ -261,6 +274,15 @@ pub const Pool = struct {
             self._allocator.destroy(conn);
             self.dropSlot();
             return;
+        }
+
+        if (self._opts.reset) |sql| {
+            conn.queueReset(sql) catch {
+                conn.deinit();
+                self._allocator.destroy(conn);
+                self.dropSlot();
+                return;
+            };
         }
 
         conn._idle_since = now;
@@ -592,6 +614,57 @@ test "Pool: a dirty connection is closed on release and replaced on demand" {
     defer pool.release(c2);
     try expectStats(pool, .{ .size = 1, .available = 0, .missing = 0, .in_use = 1 });
     _ = try c2.exec("select 1", .{});
+}
+
+test "Pool: reset clears the session between users" {
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .reset = Pool.reset_sql, .connect = .{ .statement_cache_size = 8 } });
+    defer pool.deinit();
+
+    {
+        const c = try pool.acquire();
+        defer pool.release(c);
+        _ = try c.exec("select set_config('pgz.tenant', '42', false)", .{});
+        _ = try c.exec("set search_path = pg_catalog", .{});
+        _ = try c.exec("create temp table pgz_reset_tmp (id int)", .{});
+        // and a cached statement, which must survive the reset
+        var row = (try c.row("select $1::int", .{@as(i32, 7)})).?;
+        defer row.deinit() catch {};
+        try t.expectEqual(7, try row.get(i32, 0));
+    }
+    for (0..2) |_| {
+        // the same connection: nothing of what the last user set is left
+        const c = try pool.acquire();
+        defer pool.release(c);
+        {
+            var row = (try c.row("select coalesce(current_setting('pgz.tenant', true), ''), current_setting('search_path'), to_regclass('pgz_reset_tmp') is null", .{})).?;
+            defer row.deinit() catch {};
+            try t.expectString("", try row.get([]const u8, 0));
+            try t.expectString("\"$user\", public", try row.get([]const u8, 1));
+            try t.expectEqual(true, try row.get(bool, 2));
+        }
+        var row = (try c.row("select $1::int", .{@as(i32, 8)})).?;
+        defer row.deinit() catch {};
+        try t.expectEqual(8, try row.get(i32, 0));
+    }
+    try expectStats(pool, .{ .size = 1, .available = 1, .missing = 0, .in_use = 0 });
+}
+
+test "Pool: a connection whose reset fails is closed" {
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .reset = "select 1/0" });
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+    _ = try c1.exec("select 1", .{});
+    pool.release(c1);
+
+    const c2 = try pool.acquire();
+    try t.expectError(error.SessionResetFailed, c2.exec("select 2", .{}));
+    pool.release(c2);
+    try expectStats(pool, .{ .size = 1, .available = 0, .missing = 1, .in_use = 0 });
+
+    const c3 = try pool.acquire();
+    defer pool.release(c3);
+    _ = try c3.exec("select 3", .{});
 }
 
 test "Pool: a waiter opens a connection when a dirty one is released" {
