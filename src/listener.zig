@@ -111,47 +111,7 @@ pub const Listener = struct {
         timeout: u32 = 0,
     };
     pub fn listen(self: *Listener, channel: []const u8, opts: ListenOpts) !void {
-        // LISTEN doesn't support parameterized queries. It has to be a simple query.
-        // We don't use proto.Query because we want to quote the identifier.
-
-        // PostgreSQL cuts a longer identifier to its first 63 bytes
-        // (NAMEDATALEN - 1), so two longer names could be one channel.
-        if (channel.len > max_channel_len) {
-            return error.ChannelNameTooLong;
-        }
-
-        const buf = &self._buf;
-        buf.reset();
-
-        // 'Q' + length (4) + "LISTEN " (7) + the quoted identifier (2 quotes,
-        // and every character doubled at most) + null terminator
-        try buf.ensureTotalCapacity(1 + 4 + 7 + 2 + 2 * channel.len + 1);
-        buf.writeByteAssumeCapacity('Q');
-
-        var len_view = try buf.skip(4);
-
-        buf.writeAssumeCapacity("LISTEN \"");
-
-        // + 4 for the length itself
-        // + 7 for the LISTEN
-        // + 2 for the quotes
-        // + 1 for the null terminator
-        var len = 11 + channel.len + 3;
-        for (channel) |c| {
-            if (c == '"') {
-                len += 1;
-                buf.writeAssumeCapacity("\"\"");
-            } else {
-                buf.writeByteAssumeCapacity(c);
-            }
-        }
-        buf.writeByteAssumeCapacity('"');
-        buf.writeByteAssumeCapacity(0);
-
-        // fill in the length
-        len_view.writeIntBig(u32, @intCast(len));
-
-        try self._stream.writeAll(buf.string());
+        try self.writeChannelQuery("LISTEN", channel);
 
         {
             // we expect a command complete ('C')
@@ -172,6 +132,99 @@ pub const Listener = struct {
         }
 
         try self._reader.startFlow(null, opts.timeout);
+    }
+
+    /// `LISTEN channel` without waiting for the answer. The reply
+    /// (CommandComplete, ReadyForQuery) comes through `nextEvent`, which
+    /// skips the first and reports the second as `.ready`. Safe while
+    /// another task waits in `nextEvent`: one task writes at a time (the
+    /// caller serializes the `send*` calls).
+    pub fn sendListen(self: *Listener, channel: []const u8) !void {
+        try self.writeChannelQuery("LISTEN", channel);
+    }
+
+    /// `UNLISTEN channel`, as `sendListen`.
+    pub fn sendUnlisten(self: *Listener, channel: []const u8) !void {
+        try self.writeChannelQuery("UNLISTEN", channel);
+    }
+
+    /// An empty query (`;`): its ReadyForQuery (`.ready` from `nextEvent`)
+    /// shows the connection is alive. Written as `sendListen` is.
+    pub fn sendPing(self: *Listener) !void {
+        // 'Q' + length (4 + 2) + ";" + null terminator
+        try self._stream.writeAll(&[_]u8{ 'Q', 0, 0, 0, 6, ';', 0 });
+    }
+
+    pub const Event = union(enum) {
+        notification: NotificationResponse,
+        /// A ReadyForQuery: a `sendListen`, `sendUnlisten` or `sendPing`
+        /// was answered.
+        ready,
+    };
+
+    /// The next notification, or the ReadyForQuery that ends a command
+    /// sent with `sendListen`, `sendUnlisten` or `sendPing`. The
+    /// command's CommandComplete, an EmptyQueryResponse, ParameterStatus
+    /// and notices are skipped; an ErrorResponse is `error.PG` with `err`
+    /// set. The notification points into the reader's buffer, valid until
+    /// the next call. Waits as `next` does; `stop` from another task ends
+    /// the wait with an error.
+    pub fn nextEvent(self: *Listener) !Event {
+        while (true) {
+            const msg = try self.read();
+            switch (msg.type) {
+                'A' => return .{ .notification = try NotificationResponse.parse(msg.data) },
+                'Z' => return .ready,
+                'C', 'I', 'S' => {},
+                else => return error.UnexpectedDBMessage,
+            }
+        }
+    }
+
+    /// `<verb> "channel"` as a simple query. LISTEN doesn't support
+    /// parameterized queries, so it has to be a simple query; we don't use
+    /// proto.Query because we want to quote the identifier.
+    fn writeChannelQuery(self: *Listener, verb: []const u8, channel: []const u8) !void {
+        // PostgreSQL cuts a longer identifier to its first 63 bytes
+        // (NAMEDATALEN - 1), so two longer names could be one channel.
+        if (channel.len > max_channel_len) {
+            return error.ChannelNameTooLong;
+        }
+
+        const buf = &self._buf;
+        buf.reset();
+
+        // 'Q' + length (4) + the verb and a space + the quoted identifier
+        // (2 quotes, and every character doubled at most) + null terminator
+        try buf.ensureTotalCapacity(1 + 4 + verb.len + 1 + 2 + 2 * channel.len + 1);
+        buf.writeByteAssumeCapacity('Q');
+
+        var len_view = try buf.skip(4);
+
+        buf.writeAssumeCapacity(verb);
+        buf.writeByteAssumeCapacity(' ');
+        buf.writeByteAssumeCapacity('"');
+
+        // + 4 for the length itself
+        // + the verb and a space
+        // + 2 for the quotes
+        // + 1 for the null terminator
+        var len = 4 + verb.len + 1 + channel.len + 3;
+        for (channel) |c| {
+            if (c == '"') {
+                len += 1;
+                buf.writeAssumeCapacity("\"\"");
+            } else {
+                buf.writeByteAssumeCapacity(c);
+            }
+        }
+        buf.writeByteAssumeCapacity('"');
+        buf.writeByteAssumeCapacity(0);
+
+        // fill in the length
+        len_view.writeIntBig(u32, @intCast(len));
+
+        try self._stream.writeAll(buf.string());
     }
 
     pub fn next(self: *Listener) ?NotificationResponse {
@@ -308,6 +361,52 @@ fn testListener(l: *Listener) !void {
     reset.set(io);
     try t.expectEqual(null, l.next());
     try notifier.await(io);
+}
+
+test "Listener: LISTEN and UNLISTEN without waiting, while another task waits in nextEvent" {
+    const io = t.io;
+    var l = try Listener.open(io, t.allocator, .{ .host = "127.0.0.1" });
+    defer l.deinit();
+    try l.auth(t.authOpts(.{}));
+
+    // sendListen answers through nextEvent.
+    try l.sendListen("nb_1");
+    try l.sendListen("nb_2");
+    try expectReady(try l.nextEvent());
+    try expectReady(try l.nextEvent());
+
+    // A notification, then a second channel listened to while a task waits.
+    var waiter = try io.concurrent(struct {
+        fn run(ll: *Listener) !void {
+            const ev = try ll.nextEvent();
+            try t.expectString("nb_1", ev.notification.channel);
+            try t.expectString("one", ev.notification.payload);
+            // The LISTEN sent meanwhile is answered next.
+            try expectReady(try ll.nextEvent());
+            const ev2 = try ll.nextEvent();
+            try t.expectString("nb_3", ev2.notification.channel);
+        }
+    }.run, .{&l});
+    defer waiter.cancel(io) catch {};
+
+    var c = try t.connect(.{});
+    defer c.deinit();
+    _ = c.exec("select pg_notify($1, $2)", .{ "nb_1", "one" }) catch unreachable;
+    try l.sendListen("nb_3");
+    _ = c.exec("select pg_notify($1, $2)", .{ "nb_3", "three" }) catch unreachable;
+    try waiter.await(io);
+
+    // UNLISTEN stops delivery; a ping is answered with .ready.
+    try l.sendUnlisten("nb_3");
+    try expectReady(try l.nextEvent());
+    _ = c.exec("select pg_notify($1, $2)", .{ "nb_3", "after" }) catch unreachable;
+    try l.sendPing();
+    // The ping's ReadyForQuery comes with no notification before it.
+    try expectReady(try l.nextEvent());
+}
+
+fn expectReady(ev: Listener.Event) !void {
+    try t.expectEqual(true, ev == .ready);
 }
 
 fn testNotifier() !void {
