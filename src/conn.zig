@@ -778,6 +778,13 @@ pub const Conn = struct {
         }
     }
 
+    // Bytes the socket accepted since the connection opened (see
+    // Stream.bytesSent). A call that failed while this stayed the same sent
+    // nothing of its statement: running it again elsewhere is safe.
+    pub fn bytesSent(self: *const Conn) u64 {
+        return self._stream.bytesSent();
+    }
+
     pub fn write(self: *Conn, data: []const u8) !void {
         self._stream.writeAll(data) catch |err| {
             self._state = .fail;
@@ -954,6 +961,22 @@ test "Conn: auth scram-sha-256 password" {
         var conn = try Conn.open(t.io, t.allocator, .{});
         defer conn.deinit();
         try conn.auth(.{ .username = "pgz_user_scram_sha256", .password = "pgz_user_scram_sha256_pw", .database = "postgres" });
+    }
+}
+
+test "Conn: bytesSent counts what the socket accepted" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+    // the startup and authentication
+    const before = c.bytesSent();
+    try t.expectEqual(true, before > 0);
+    _ = try c.exec("select 1", .{});
+    const after = c.bytesSent();
+    if (c._stream.isTls()) {
+        try t.expectEqual(true, after > before);
+    } else {
+        // a simple Query: 'Q', its length, the SQL and its nul
+        try t.expectEqual(before + 1 + 4 + "select 1".len + 1, after);
     }
 }
 

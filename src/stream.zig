@@ -83,10 +83,41 @@ pub const Stream = struct {
         allocator: Allocator,
         net: Io.net.Stream,
         socket_reader: SocketReader,
+        // Unbuffered: each write is one send, whose count `sent` adds.
         socket_writer: Io.net.Stream.Writer,
+        // What the TLS module writes ciphertext to: socket_writer behind
+        // the output buffer, counting what the socket accepts.
+        tls_out: CountingWriter,
         tls: if (has_tls) ?TlsState else void,
-        // socket_reader's and socket_writer's buffers, when TLS uses them
+        // socket_reader's and tls_out's buffers, when TLS uses them
         buffers: []u8,
+        // Bytes the socket accepted since the connection opened (see bytesSent).
+        sent: u64 = 0,
+    };
+
+    // An Io.Writer in front of the socket writer that counts the bytes the
+    // socket accepts.
+    const CountingWriter = struct {
+        interface: Io.Writer,
+
+        fn init(buffer: []u8) CountingWriter {
+            return .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+        }
+
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const self: *CountingWriter = @alignCast(@fieldParentPtr("interface", w));
+            const inner: *Inner = @alignCast(@fieldParentPtr("tls_out", self));
+            const out = &inner.socket_writer.interface;
+            const buffered = w.buffered();
+            if (buffered.len != 0) {
+                const n = try out.write(buffered);
+                inner.sent += n;
+                return w.consume(n);
+            }
+            const n = try out.writeSplat(data, splat);
+            inner.sent += n;
+            return n;
+        }
     };
 
     const TlsState = if (has_tls) struct {
@@ -125,6 +156,7 @@ pub const Stream = struct {
             .net = net,
             .socket_reader = .init(io, net.socket.handle, &.{}),
             .socket_writer = net.writer(io, &.{}),
+            .tls_out = .init(&.{}),
             .tls = if (has_tls) null else {},
             .buffers = &.{},
         };
@@ -173,7 +205,7 @@ pub const Stream = struct {
         const allocator = inner.allocator;
         inner.buffers = try allocator.alloc(u8, input_len + output_len);
         inner.socket_reader.interface.buffer = inner.buffers[0..input_len];
-        inner.socket_writer = inner.net.writer(io, inner.buffers[input_len..]);
+        inner.tls_out = .init(inner.buffers[input_len..]);
 
         const handshake = TlsHandshake{
             .io = io,
@@ -186,7 +218,7 @@ pub const Stream = struct {
             .config = &opts.tls_config,
         };
         inner.tls = .{
-            .conn = tls.client(&inner.socket_reader.interface, &inner.socket_writer.interface, handshake) catch |err| {
+            .conn = tls.client(&inner.socket_reader.interface, &inner.tls_out.interface, handshake) catch |err| {
                 return self.socketError(err);
             },
             .reader = undefined,
@@ -264,9 +296,21 @@ pub const Stream = struct {
                 return;
             }
         }
+        // Unbuffered: each write is one send, counted as it goes.
         const w = &inner.socket_writer.interface;
-        w.writeAll(data) catch return inner.socket_writer.err orelse error.WriteFailed;
-        w.flush() catch return inner.socket_writer.err orelse error.WriteFailed;
+        var rest = data;
+        while (rest.len > 0) {
+            const n = w.write(rest) catch return inner.socket_writer.err orelse error.WriteFailed;
+            inner.sent += n;
+            rest = rest[n..];
+        }
+    }
+
+    // Bytes the socket accepted since the connection opened (over TLS, the
+    // ciphertext). Unchanged across a failed write: none of it was sent,
+    // so the server cannot have acted on it.
+    pub fn bytesSent(self: Stream) u64 {
+        return self.inner.sent;
     }
 
     // Reads at least 1 byte into buf, or returns 0 when the server closed the
